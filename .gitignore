@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+.DS_Store
+Thumbs.db
+* copy.py
+* copy.md
+*.pdf
+!kbrs_markup_demo_PO247946.pdf
