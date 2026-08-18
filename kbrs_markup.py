@@ -87,12 +87,14 @@ EDITABLE LAYOUT:
 
 import argparse
 import csv
+import json
 import math
 import os
 import re
 import tempfile
 from pathlib import Path
 
+import pikepdf
 from pypdf import PdfReader, PdfWriter
 from reportlab.pdfgen import canvas
 from reportlab.pdfbase.pdfmetrics import stringWidth
@@ -100,7 +102,101 @@ from reportlab.lib.colors import Color
 from reportlab.lib.utils import ImageReader
 import io
 
-ORANGE = Color(0.9490196, 0.5137255, 0.1490196)
+# The default measurement-overlay color ("orange" everywhere in this file)
+# is a per-install preference, not a hardcoded constant -- different
+# computers running this app can be set to different accent colors (e.g. to
+# visually tell whose copy generated a given production sheet) via
+# set_accent_color(), persisted here so it survives across launches.
+CONFIG_PATH = Path.home() / ".kbrs_markup_config.json"
+DEFAULT_ACCENT_HEX = "#f2842f"
+
+
+def _hex_to_color(hex_str: str) -> Color:
+    hex_str = hex_str.lstrip("#")
+    r, g, b = (int(hex_str[i:i + 2], 16) / 255 for i in (0, 2, 4))
+    return Color(r, g, b)
+
+
+def _load_config() -> dict:
+    try:
+        with open(CONFIG_PATH) as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError, OSError, ValueError):
+        return {}
+
+
+def _save_config(updates: dict) -> None:
+    """Merge updates into the existing config rather than overwriting it --
+    accent color and default output folder are independent settings sharing
+    one file."""
+    config = _load_config()
+    config.update(updates)
+    try:
+        CONFIG_PATH.write_text(json.dumps(config))
+    except OSError:
+        pass
+
+
+def get_accent_hex() -> str:
+    return _load_config().get("accent_color", DEFAULT_ACCENT_HEX)
+
+
+def set_accent_color(hex_str: str) -> None:
+    """Persist a new accent color and apply it for the rest of this run."""
+    global ORANGE
+    ORANGE = _hex_to_color(hex_str)
+    COLOR_MAP["orange"] = ORANGE
+    _save_config({"accent_color": hex_str})
+
+
+def get_default_output_dir() -> str | None:
+    return _load_config().get("default_output_dir")
+
+
+def set_default_output_dir(path: str) -> None:
+    _save_config({"default_output_dir": path})
+
+
+# A rolling history of recently generated orders (newest first), each a full
+# snapshot of that order's inputs AND its live-editor markup (dragged item
+# positions, brackets, notes, cut line, background rotate/resize) -- lets the
+# app reopen one later to make a single quick change without re-marking the
+# whole drawing up from scratch. Kept in a separate file from the small
+# accent-color/output-dir config since this one can grow much larger.
+RECENT_ORDERS_PATH = Path.home() / ".kbrs_markup_recent.json"
+MAX_RECENT_ORDERS = 15
+
+
+def get_recent_orders() -> list:
+    try:
+        with open(RECENT_ORDERS_PATH) as f:
+            data = json.load(f)
+        return data if isinstance(data, list) else []
+    except (FileNotFoundError, json.JSONDecodeError, OSError, ValueError):
+        return []
+
+
+def save_recent_order(entry: dict) -> None:
+    """Push a snapshot to the front of the recent-orders list. Regenerating
+    the same order (same output name) replaces its earlier entry instead of
+    duplicating it. Capped at MAX_RECENT_ORDERS, oldest dropped first."""
+    entries = [e for e in get_recent_orders() if e.get("label") != entry.get("label")]
+    entries.insert(0, entry)
+    entries = entries[:MAX_RECENT_ORDERS]
+    try:
+        RECENT_ORDERS_PATH.write_text(json.dumps(entries))
+    except OSError:
+        pass
+
+
+def clear_recent_orders() -> None:
+    try:
+        RECENT_ORDERS_PATH.write_text(json.dumps([]))
+    except OSError:
+        pass
+
+
+ORANGE = _hex_to_color(get_accent_hex())
 WHITE = Color(1, 1, 1)
 BLACK = Color(0, 0, 0)
 COLOR_MAP = {"orange": ORANGE, "white": WHITE, "black": BLACK}
@@ -119,21 +215,63 @@ CUT_FOR_SHIPPING_EXTRA_IN = 0.5
 # plugin) -- ask the sender to export as JPG or PNG instead.
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".bmp", ".gif"}
 _IMAGE_PDF_CACHE = {}  # original path -> (mtime, converted pdf path)
+_FLATTENED_PDF_CACHE = {}  # original path -> (mtime, flattened pdf path)
+
+
+def _flatten_pdf(path: str) -> str:
+    """Bakes any fillable AcroForm field values and Adobe comment/markup
+    annotations directly into the page content, so they show up the same way
+    in the live preview and final export as they do in Acrobat -- without
+    having to manually export to JPG first to force the flattening. A no-op
+    (returns the original path) if the PDF has no form fields or annotations
+    to begin with, or if it can't be opened (encrypted/corrupt -- falls back
+    to using the file as-is rather than blocking the whole import)."""
+    try:
+        mtime = os.path.getmtime(path)
+    except OSError:
+        mtime = None
+    cached = _FLATTENED_PDF_CACHE.get(path)
+    if cached and cached[0] == mtime and os.path.isfile(cached[1]):
+        return cached[1]
+
+    try:
+        with pikepdf.open(path) as pdf:
+            has_form = "/AcroForm" in pdf.Root
+            has_annots = any("/Annots" in page for page in pdf.pages)
+            if not has_form and not has_annots:
+                _FLATTENED_PDF_CACHE[path] = (mtime, path)
+                return path
+            pdf.generate_appearance_streams()
+            pdf.flatten_annotations(mode="all")
+            fd, out_path = tempfile.mkstemp(suffix=".pdf", prefix="kbrs_flat_")
+            os.close(fd)
+            pdf.save(out_path)
+    except Exception:
+        _FLATTENED_PDF_CACHE[path] = (mtime, path)
+        return path
+
+    _FLATTENED_PDF_CACHE[path] = (mtime, out_path)
+    return out_path
 
 
 def ensure_pdf(path: str) -> str:
-    """If `path` is an image (jpg/png/etc.), convert it to a one-page,
-    Letter-size (612x792pt) PDF and return the path to that converted PDF
-    (cached by path+mtime so repeated preview refreshes don't reconvert
-    every time). If `path` is already a .pdf, returns it unchanged.
+    """If `path` is an image (jpg/png/etc.), wrap it in a one-page PDF sized
+    to match the image's own true pixel proportions, and return the path to
+    that converted PDF (cached by path+mtime so repeated preview refreshes
+    don't reconvert every time). If `path` is already a .pdf, returns it
+    unchanged.
 
-    The image is stretched to fill the full page -- the real order-form PDFs
-    this app was calibrated against are themselves just a full-page scanned
-    image wrapped in a PDF, so this matches that exactly as long as the scan
-    captures the whole page edge-to-edge."""
+    The page is deliberately NOT resized or stretched to Letter (612x792)
+    here -- a real order form isn't always that shape (landscape photos,
+    forms saved at A4, etc.), and forcing it to fit would visibly distort
+    the customer's actual drawing. Every calibrated PROFILES coordinate
+    stays defined in a fixed Letter-space reference regardless of the real
+    page's size; get_page_size() + the scaling in merge_pdf() (and the live
+    editor's canvas math) are what reconcile the two -- the scan itself is
+    never touched."""
     ext = Path(path).suffix.lower()
     if ext == ".pdf":
-        return path
+        return _flatten_pdf(path)
     if ext not in IMAGE_EXTS:
         raise ValueError(
             f"Unsupported order-form file type '{ext or '(no extension)'}'. "
@@ -149,10 +287,99 @@ def ensure_pdf(path: str) -> str:
 
     fd, out_path = tempfile.mkstemp(suffix=".pdf", prefix="kbrs_scan_")
     os.close(fd)
-    c = canvas.Canvas(out_path, pagesize=(PAGE_W, PAGE_H))
-    c.drawImage(ImageReader(path), 0, 0, width=PAGE_W, height=PAGE_H)
+    img_reader = ImageReader(path)
+    img_w, img_h = img_reader.getSize()
+    # img_w/img_h are the image's raw PIXEL dimensions -- a modern phone
+    # photo can be several thousand pixels on a side, which would otherwise
+    # become a page that many POINTS across (tens of inches), forcing
+    # constant scrolling to see any of it. Scale down (preserving the image's
+    # true proportions -- never distorting it) so the longer edge matches a
+    # normal page's long edge instead.
+    long_edge = max(img_w, img_h)
+    if long_edge > PAGE_H:
+        page_scale = PAGE_H / long_edge
+        img_w, img_h = img_w * page_scale, img_h * page_scale
+    c = canvas.Canvas(out_path, pagesize=(img_w, img_h))
+    c.drawImage(img_reader, 0, 0, width=img_w, height=img_h)
     c.save()
     _IMAGE_PDF_CACHE[path] = (mtime, out_path)
+    return out_path
+
+
+def _effective_page_size(page) -> tuple:
+    """(width, height) as the page is actually displayed, accounting for its
+    /Rotate attribute -- the mediabox stays in the page's own un-rotated
+    coordinate space, /Rotate just tells viewers to rotate on display, so a
+    90/270-rotated page's effective width/height are swapped from what its
+    raw mediabox says."""
+    w, h = float(page.mediabox.width), float(page.mediabox.height)
+    if page.rotation % 180 == 90:
+        w, h = h, w
+    return w, h
+
+
+def get_page_size(order_form_pdf: str) -> tuple:
+    """Real (width, height) in points of the order-form PDF's first page as
+    displayed, after ensure_pdf() conversion if needed. Used by the live
+    editor to scale canvas coordinates between the real page and the fixed
+    Letter-space (PAGE_W x PAGE_H) that PROFILES calibration assumes."""
+    pdf_path = ensure_pdf(order_form_pdf)
+    reader = PdfReader(pdf_path)
+    return _effective_page_size(reader.pages[0])
+
+
+_BG_TRANSFORM_CACHE = {}  # (path, mtime, rotation, scale) -> transformed pdf path
+
+
+def get_transformed_order_form(order_form_path: str, rotation: int = 0, scale: float = 1.0) -> str:
+    """A version of the order-form PDF with the given rotation (0/90/180/270)
+    and scale (1.0 = unchanged) applied -- for reorienting/resizing a
+    drawing that was scanned sideways or is awkwardly small/large on the
+    page. Cached by path+mtime+rotation+scale. Returns the plain
+    ensure_pdf()-converted path unchanged if rotation is 0 and scale is 1.0.
+
+    Implemented by rendering the page to a high-resolution image and
+    re-wrapping that at the transformed size (same approach ensure_pdf()
+    already uses for image scans), rather than a PDF-level rotate/scale --
+    a PDF page's /Rotate flag doesn't change its underlying raw content
+    coordinate space, and merge_pdf()'s overlay compositing operates in
+    that raw space, so a metadata-only rotation would leave the overlay
+    landing in the wrong place relative to the visibly-rotated background."""
+    base_path = ensure_pdf(order_form_path)
+    rotation = rotation % 360
+    if rotation == 0 and abs(scale - 1.0) < 0.001:
+        return base_path
+    try:
+        mtime = os.path.getmtime(order_form_path)
+    except OSError:
+        mtime = None
+    cache_key = (order_form_path, mtime, rotation, round(scale, 3))
+    cached = _BG_TRANSFORM_CACHE.get(cache_key)
+    if cached and os.path.isfile(cached):
+        return cached
+
+    import pypdfium2 as pdfium  # local import: only needed for this rare path
+    render_scale = 2.5  # comfortably print-quality even after a downscale
+    pdf = pdfium.PdfDocument(base_path)
+    page = pdf[0]
+    pil_img = page.render(scale=render_scale).to_pil()
+    pdf.close()
+    if rotation:
+        # PIL rotates counter-clockwise for positive angles; PDF /Rotate and
+        # the app's other 90-degree rotations (bracket, cut line) are
+        # clockwise, so negate to match that convention.
+        pil_img = pil_img.rotate(-rotation, expand=True)
+    if abs(scale - 1.0) >= 0.001:
+        new_size = (max(1, round(pil_img.width * scale)), max(1, round(pil_img.height * scale)))
+        pil_img = pil_img.resize(new_size)
+
+    fd, out_path = tempfile.mkstemp(suffix=".pdf", prefix="kbrs_bgtransform_")
+    os.close(fd)
+    page_w, page_h = pil_img.width / render_scale, pil_img.height / render_scale
+    c = canvas.Canvas(out_path, pagesize=(page_w, page_h))
+    c.drawImage(ImageReader(pil_img), 0, 0, width=page_w, height=page_h)
+    c.save()
+    _BG_TRANSFORM_CACHE[cache_key] = out_path
     return out_path
 
 # Material name -> bar fill color. Matched as a substring, case-insensitive,
@@ -165,6 +392,7 @@ MATERIAL_COLOR_WORDS = [
     ("GREEN", Color(0.0, 0.5019608, 0.0)),
     ("BLUE", Color(0.0, 0.572549, 0.8392157)),
     ("RED", Color(0.75, 0.11, 0.11)),
+    ("PURPLE", Color(0.29, 0.0, 0.51)),
     ("BLACK", Color(0.15, 0.15, 0.15)),
     ("WHITE", Color(0.92, 0.92, 0.92)),
     ("BEIGE", Color(0.76, 0.70, 0.60)),
@@ -177,7 +405,7 @@ DEFAULT_BAR_COLOR = Color(0.35, 0.35, 0.35)
 # Dropdown presets for the app UI -- the "<color> TRAVELER" materials
 # actually seen/requested so far. The combobox stays editable so any other
 # material name can still be typed in directly.
-MATERIAL_PRESETS = ["GRAY TRAVELER", "GREEN TRAVELER", "BLUE TRAVELER", "RED TRAVELER"]
+MATERIAL_PRESETS = ["GRAY TRAVELER", "GREEN TRAVELER", "BLUE TRAVELER", "RED TRAVELER", "PURPLE TRAVELER"]
 
 
 def resolve_bar_color(material: str):
@@ -306,8 +534,8 @@ def inches_to_decimal(s: str) -> float:
 
 
 def fmt_inches(val: float) -> str:
-    """34.25 -> '34.25', 35.5 -> '35.5', 36.0 -> '36'"""
-    s = f"{val:.2f}".rstrip("0").rstrip(".")
+    """34.25 -> '34.25', 35.5 -> '35.5', 36.0 -> '36', 40.1234 -> '40.1234'"""
+    s = f"{val:.4f}".rstrip("0").rstrip(".")
     return s if s else "0"
 
 
@@ -380,6 +608,17 @@ def parse_production_order(pdf_path: str) -> dict:
         r'([A-Z]+-[\w-]+):\s*(.+?)\s*\(([\d\s/-]+)"?\s*x\s*([\d\s/-]+)"?\)', text
     )
     if not item_match:
+        # Some production orders print dimensions directly after the item
+        # name with no parentheses at all, e.g. '...ShowerSlope  80 1/4" x
+        # 60" 4701-5000 sq. inches.'. Tried only as a fallback (not merged
+        # into the pattern above) and the inch mark is required here, unlike
+        # the parenthesized form -- without that anchor, a stray number
+        # embedded in the item name could get mistaken for the real
+        # dimensions.
+        item_match = re.search(
+            r'([A-Z]+-[\w-]+):\s*(.+?)\s*([\d\s/-]+)"\s*x\s*([\d\s/-]+)"', text
+        )
+    if not item_match:
         raise ValueError(f"Could not find item/dimension line in {pdf_path}. Raw text:\n{text}")
 
     sku, item_name, raw_w, raw_h = item_match.groups()
@@ -435,8 +674,9 @@ def make_thickness_item(profile: dict, thickness: str) -> dict:
     fsize = profile["font_size_dim"]
     tsize = profile.get("font_size_thickness", fsize)
     x, y = profile["thickness_text_pos"]
+    text = thickness if thickness.endswith('"') else thickness + '"'
     return {
-        "key": "thickness", "kind": "text", "text": thickness,
+        "key": "thickness", "kind": "text", "text": text,
         "x": x, "y": y - tsize * 0.78, "font_size": tsize, "color": "orange",
         "fixed_cover": profile.get("thickness_cover"), "moved": False,
         "deletable": False, "editable_text": True,
@@ -452,9 +692,14 @@ def compute_default_items(profile: dict, oversize_w: float, oversize_h: float, t
 
 def make_cut_line_items() -> list:
     """Default cut-for-shipping dashed line + label. There's no fixed rule
-    for where the cut goes -- drag it to the real position for that job."""
+    for where the cut goes -- drag it to the real position for that job.
+    x0/y0/x1/y1 (rather than a single x + two y's) so the line can be
+    rotated to run horizontally too, not just vertically; "orientation"
+    tracks which axis the +CUT_FOR_SHIPPING_EXTRA_IN oversize bump applies
+    to (see toggle_cut_line/_rotate_cut_line in app.py)."""
     line = {
-        "key": "cut_line", "kind": "line", "x": PAGE_W / 2, "y0": 240.0, "y1": 540.0,
+        "key": "cut_line", "kind": "line", "orientation": "vertical",
+        "x0": PAGE_W / 2, "y0": 240.0, "x1": PAGE_W / 2, "y1": 540.0,
         "color": "orange", "line_width": 10.0, "dashed": True, "deletable": True,
     }
     label = {
@@ -478,9 +723,34 @@ def make_note_item(text: str = "New note", x: float = PAGE_W / 2 - 60, y: float 
     }
 
 
-def rotate_point(pt: tuple, pivot: tuple, degrees: int) -> tuple:
-    """Rotate pt around pivot by an exact multiple of 90 degrees (no float
-    drift, unlike a general sin/cos rotation)."""
+# Blue Traveler orders are standardly 1.5" thick with a flange edge on all
+# sides -- both auto-fill when that material is selected/detected (see
+# InteractiveLayout._sync_flange_note()/SingleOrderTab._maybe_autofill_
+# blue_traveler_thickness() in app.py), same "auto-fill unless you've
+# overridden it" contract as the CLSS/CLTB drain-A thickness formula and the
+# calibrated thickness item -- editable/deletable like any other note.
+BLUE_TRAVELER_THICKNESS_IN = "1.5"
+FLANGE_NOTE_KEY = "flange_note"
+FLANGE_NOTE_TEXT = "FLANGE ON ALL SIDES"
+
+
+def is_blue_traveler(material: str) -> bool:
+    return material.strip().upper() == "BLUE TRAVELER"
+
+
+def make_flange_note_item() -> dict:
+    return {
+        "key": FLANGE_NOTE_KEY, "kind": "text", "text": FLANGE_NOTE_TEXT,
+        "x": PAGE_W / 2 - 110, "y": 160.0, "font_size": 18, "color": "black",
+        "fixed_cover": None, "moved": True, "deletable": True, "editable_text": True,
+    }
+
+
+def rotate_point(pt: tuple, pivot: tuple, degrees: float) -> tuple:
+    """Rotate pt around pivot by any angle. Exact multiples of 90 take a
+    fast path with plain dx/dy swaps (no float drift); anything else (e.g.
+    the bracket's 45-degree steps, for neo-angle showers that don't land on
+    a clean 90-degree corner) falls back to a normal sin/cos rotation."""
     dx, dy = pt[0] - pivot[0], pt[1] - pivot[1]
     degrees = degrees % 360
     if degrees == 90:
@@ -489,13 +759,93 @@ def rotate_point(pt: tuple, pivot: tuple, degrees: int) -> tuple:
         dx, dy = -dx, -dy
     elif degrees == 270:
         dx, dy = dy, -dx
+    elif degrees != 0:
+        rad = math.radians(degrees)
+        cos_a, sin_a = math.cos(rad), math.sin(rad)
+        dx, dy = dx * cos_a - dy * sin_a, dx * sin_a + dy * cos_a
     return (pivot[0] + dx, pivot[1] + dy)
 
 
+def _material_bar_rect(profile: dict, material: str, bar_offset: tuple) -> tuple:
+    bx0, by0, bx1, by1 = profile["material_bar"]
+    bdx, bdy = bar_offset
+    bx0, by0, bx1, by1 = bx0 + bdx, by0 + bdy, bx1 + bdx, by1 + bdy
+    fsize_material = profile["font_size_material"]
+    text_w = stringWidth(material.upper(), "Helvetica-Bold", fsize_material)
+    bar_w = max(bx1 - bx0, text_w + 10 * 2)
+    return bx0, by0, bx0 + bar_w, by1
+
+
+def _bracket_points(profile: dict, wide_origin: bool, bracket_offset: tuple, bracket_rotation: int) -> list:
+    pts = profile["bracket_wide"] if (wide_origin and "bracket_wide" in profile) else profile["bracket"]
+    dx, dy = bracket_offset
+    pts = [(px + dx, py + dy) for px, py in pts]
+    if bracket_rotation:
+        pivot = pts[1]  # the elbow -- the actual corner vertex the bracket marks
+        pts = [rotate_point(pt, pivot, bracket_rotation) for pt in pts]
+    return pts
+
+
+_DEFAULT_BRACKETS = [{"offset": (0.0, 0.0), "rotation": 0}]
+
+
+def _content_bbox(profile: dict, material: str, items: list, wide_origin: bool,
+                   brackets: list, bar_offset: tuple) -> tuple:
+    """Bounding box (min_x, min_y, max_x, max_y) of everything render_page()
+    is about to draw, unioned with the normal (0,0)-(PAGE_W,PAGE_H) page so
+    a bracket/bar/item dragged outside the normal page (e.g. after rotating
+    the background drawing) never gets silently clipped on export -- the
+    whole overlay gets sized to include it instead, however far out it is."""
+    min_x, min_y, max_x, max_y = 0.0, 0.0, PAGE_W, PAGE_H
+
+    def extend(x, y):
+        nonlocal min_x, min_y, max_x, max_y
+        min_x, min_y = min(min_x, x), min(min_y, y)
+        max_x, max_y = max(max_x, x), max(max_y, y)
+
+    bx0, by0, bx1, by1 = _material_bar_rect(profile, material, bar_offset)
+    extend(bx0, by0)
+    extend(bx1, by1)
+
+    for bracket in brackets:
+        for px, py in _bracket_points(profile, wide_origin, bracket["offset"], bracket["rotation"]):
+            extend(px, py)
+
+    for item in items:
+        if item["kind"] == "line":
+            extend(item["x0"], item["y0"])
+            extend(item["x1"], item["y1"])
+        else:
+            lines = item["text"].split("\n")
+            fsize = item["font_size"]
+            w = max((stringWidth(ln, "Helvetica-Bold", fsize) for ln in lines), default=0)
+            h = fsize * 1.15 * len(lines)
+            extend(item["x"], item["y"])
+            extend(item["x"] + w, item["y"] + h)
+
+    return min_x, min_y, max_x, max_y
+
+
 def render_page(profile: dict, material: str, items: list, wide_origin: bool = False,
-                 bracket_offset: tuple = (0.0, 0.0), bracket_rotation: int = 0) -> bytes:
+                 brackets: list = None, bar_offset: tuple = (0.0, 0.0)) -> bytes:
+    # brackets is a list of {"offset": (dx,dy), "rotation": 0/90/180/270} --
+    # some orders need more than one CNC/CAD reference point. Defaults to a
+    # single un-adjusted bracket at the calibrated position.
+    if brackets is None:
+        brackets = _DEFAULT_BRACKETS
+
+    # Everything is normally within the calibrated (0,0)-(PAGE_W,PAGE_H) box,
+    # but a manually dragged bracket/bar/item can end up outside it -- size
+    # the overlay's own page to whatever actually needs to fit (never
+    # smaller than the normal page) and shift every draw call by the box's
+    # origin, so nothing is ever silently cut off. merge_pdf() then scales
+    # this correctly-sized overlay onto the real target page as usual.
+    min_x, min_y, max_x, max_y = _content_bbox(profile, material, items, wide_origin, brackets, bar_offset)
+    off_x, off_y = -min_x, -min_y
+    page_w, page_h = max_x - min_x, max_y - min_y
+
     buf = io.BytesIO()
-    c = canvas.Canvas(buf, pagesize=(PAGE_W, PAGE_H))
+    c = canvas.Canvas(buf, pagesize=(page_w, page_h))
 
     # material bar, color derived from the material name (always automatic).
     # Width is sized to fit whatever material text is actually entered
@@ -504,17 +854,17 @@ def render_page(profile: dict, material: str, items: list, wide_origin: bool = F
     # as invisible white-on-white text past its right edge.
     bar_color = resolve_bar_color(material)
     text_color = resolve_text_color(bar_color)
-    bx0, by0, bx1, by1 = profile["material_bar"]
+    bx0, by0, bx1, by1 = _material_bar_rect(profile, material, bar_offset)
+    bx0, by0, bx1, by1 = bx0 + off_x, by0 + off_y, bx1 + off_x, by1 + off_y
     fsize_material = profile["font_size_material"]
     label_text = material.upper()
-    text_w = stringWidth(label_text, "Helvetica-Bold", fsize_material)
-    pad = 10
-    bar_w = max(bx1 - bx0, text_w + pad * 2)
     c.setFillColor(bar_color)
-    c.rect(bx0, by0, bar_w, by1 - by0, stroke=0, fill=1)  # square corners, no pill/stadium shape
+    c.rect(bx0, by0, bx1 - bx0, by1 - by0, stroke=0, fill=1)  # square corners, no pill/stadium shape
     c.setFillColor(text_color)
     c.setFont("Helvetica-Bold", fsize_material)
     mx, _my = profile["material_text_pos"]
+    bdx, _bdy = bar_offset
+    mx += bdx + off_x
     # Center the text vertically within the bar itself (rather than trusting
     # the originally-calibrated y position), so it always sits on the bar
     # regardless of small calibration drift.
@@ -527,9 +877,10 @@ def render_page(profile: dict, material: str, items: list, wide_origin: bool = F
             c.setStrokeColor(COLOR_MAP.get(item["color"], ORANGE))
             c.setLineWidth(item.get("line_width", 10.0))
             c.setDash([6, 6] if item.get("dashed") else [])
-            c.line(item["x"], item["y0"], item["x"], item["y1"])
+            c.line(item["x0"] + off_x, item["y0"] + off_y, item["x1"] + off_x, item["y1"] + off_y)
             c.setDash([])
         elif item["kind"] == "text":
+            ix, iy = item["x"] + off_x, item["y"] + off_y
             lines = item["text"].split("\n")
             fsize = item["font_size"]
             color = COLOR_MAP.get(item["color"], ORANGE)
@@ -538,7 +889,7 @@ def render_page(profile: dict, material: str, items: list, wide_origin: bool = F
             if not item.get("moved") and item.get("fixed_cover"):
                 x0, y0, x1, y1 = item["fixed_cover"]
                 c.setFillColor(WHITE)
-                c.rect(x0, y0, x1 - x0, y1 - y0, stroke=0, fill=1)
+                c.rect(x0 + off_x, y0 + off_y, x1 - x0, y1 - y0, stroke=0, fill=1)
             # 2) always also paint a padded white box snug around the new
             #    text itself, so numbers/thickness stay clearly readable on
             #    top of the drawing even if the scan doesn't line up exactly
@@ -548,30 +899,26 @@ def render_page(profile: dict, material: str, items: list, wide_origin: bool = F
                 h = fsize * 1.15 * len(lines)
                 pad = 6
                 c.setFillColor(WHITE)
-                c.rect(item["x"] - pad, item["y"] - pad, w + pad * 2, h + pad * 2, stroke=0, fill=1)
+                c.rect(ix - pad, iy - pad, w + pad * 2, h + pad * 2, stroke=0, fill=1)
             c.setFillColor(color)
             c.setFont("Helvetica-Bold", fsize)
             for i, ln in enumerate(lines):
-                c.drawString(item["x"], item["y"] - i * fsize * 1.15, ln)
+                c.drawString(ix, iy - i * fsize * 1.15, ln)
 
-    # origin bracket (CNC/CAD reference corner) -- automatic by default, but
-    # draggable and rotatable in the app's live editor when a calibrated
-    # position turns out to be wrong for a given order; bracket_offset is
-    # (0, 0) and bracket_rotation is 0 unless the user has manually adjusted
-    # it there.
-    pts = profile["bracket_wide"] if (wide_origin and "bracket_wide" in profile) else profile["bracket"]
-    dx, dy = bracket_offset
-    pts = [(px + dx, py + dy) for px, py in pts]
-    if bracket_rotation:
-        pivot = pts[1]  # the elbow -- the actual corner vertex the bracket marks
-        pts = [rotate_point(pt, pivot, bracket_rotation) for pt in pts]
-    c.setStrokeColor(ORANGE)
-    c.setLineWidth(profile["bracket_width"])
-    p = c.beginPath()
-    p.moveTo(pts[0][0], pts[0][1])
-    for pt in pts[1:]:
-        p.lineTo(pt[0], pt[1])
-    c.drawPath(p, stroke=1, fill=0)
+    # origin bracket(s) (CNC/CAD reference corner) -- automatic by default,
+    # but draggable, rotatable, and duplicable in the app's live editor when
+    # a calibrated position turns out to be wrong or an order needs more
+    # than one reference point; each bracket's offset is (0, 0) and rotation
+    # is 0 unless the user has manually adjusted it there.
+    for bracket in brackets:
+        pts = _bracket_points(profile, wide_origin, bracket["offset"], bracket["rotation"])
+        c.setStrokeColor(ORANGE)
+        c.setLineWidth(profile["bracket_width"])
+        p = c.beginPath()
+        p.moveTo(pts[0][0] + off_x, pts[0][1] + off_y)
+        for pt in pts[1:]:
+            p.lineTo(pt[0] + off_x, pt[1] + off_y)
+        c.drawPath(p, stroke=1, fill=0)
 
     c.save()
     buf.seek(0)
@@ -594,7 +941,19 @@ def merge_pdf(order_form_pdf: str, production_order_pdf: str, overlay_bytes: byt
 
     writer = PdfWriter()
     page0 = order_reader.pages[0]
-    page0.merge_page(overlay_reader.pages[0])
+    overlay_page = overlay_reader.pages[0]
+    real_w, real_h = _effective_page_size(page0)
+    if abs(real_w - PAGE_W) > 0.5 or abs(real_h - PAGE_H) > 0.5:
+        # The overlay is always rendered on a fixed Letter-size canvas
+        # (PAGE_W x PAGE_H) to match the PROFILES calibration, but not every
+        # customer order-form PDF is actually Letter-sized (e.g. scanned/
+        # saved as A4 by whatever tool produced it). pypdf's merge_page()
+        # does no scaling of its own -- without this, the overlay's
+        # coordinates get stamped onto a differently-sized page unscaled,
+        # landing every dragged/calibrated position in the wrong spot even
+        # though the drag itself was recorded correctly.
+        overlay_page.scale_to(real_w, real_h)
+    page0.merge_page(overlay_page)
     writer.add_page(page0)
 
     page1 = prod_reader.pages[0]

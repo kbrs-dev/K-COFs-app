@@ -12,18 +12,15 @@ or double-click "KBRS Markup.command" in the same folder.
 """
 
 import copy
-import csv
 import io
 import os
 import re
-import subprocess
-import sys
-import threading
 import traceback
+from datetime import datetime
 from pathlib import Path
 
 import tkinter as tk
-from tkinter import ttk, filedialog, messagebox, simpledialog, font as tkfont
+from tkinter import ttk, filedialog, messagebox, simpledialog, colorchooser, font as tkfont
 
 import kbrs_markup as engine
 from pypdf import PdfReader, PdfWriter
@@ -42,7 +39,7 @@ except ImportError:
     EDITOR_AVAILABLE = False
 
 CANVAS_SCALE = 0.75  # PDF points -> editor canvas pixels
-ITEM_COLOR_HEX = {"orange": "#f2842f", "white": "#ffffff", "black": "#000000"}
+ITEM_COLOR_HEX = {"orange": engine.get_accent_hex(), "white": "#ffffff", "black": "#000000"}
 
 
 def parse_dnd_paths(data: str):
@@ -75,18 +72,6 @@ def make_drop_target(widget, on_drop):
         return
     widget.drop_target_register(DND_FILES)
     widget.dnd_bind("<<Drop>>", lambda e: on_drop(parse_dnd_paths(e.data)[0]))
-
-
-def open_in_finder(path: str):
-    try:
-        if sys.platform == "darwin":
-            subprocess.run(["open", "-R", path])
-        elif sys.platform == "win32":
-            subprocess.run(["explorer", "/select,", path])
-        else:
-            subprocess.run(["xdg-open", str(Path(path).parent)])
-    except Exception:
-        pass
 
 
 def same_file(a: str, b: str) -> bool:
@@ -161,11 +146,11 @@ class DropZone(tk.Frame):
         self.validator = validator
 
         self.name_label = tk.Label(self, bg="#f4f4f4", fg="#777", font=("", 12),
-                                    wraplength=460, justify="center")
-        self.name_label.pack(expand=True, fill="both", padx=10, pady=(14, 2))
+                                    wraplength=230, justify="center")
+        self.name_label.pack(expand=True, fill="both", padx=10, pady=(10, 2))
         self.path_label = tk.Label(self, bg="#f4f4f4", fg="#999", font=("", 9),
-                                    wraplength=460, justify="center")
-        self.path_label.pack(fill="x", padx=10, pady=(0, 10))
+                                    wraplength=230, justify="center")
+        self.path_label.pack(fill="x", padx=10, pady=(0, 8))
 
         self._refresh()
         self.var.trace_add("write", lambda *_: self._refresh())
@@ -223,23 +208,50 @@ class InteractiveLayout(ttk.Frame):
         self.has_cut_line = False
         self.items = []
         self.canvas_ids = {}
+        self.cover_ids = {}  # dynamic white box tracking each item's text
+        self.fixed_cover_ids = {}  # calibrated white box blanking the original scan value, pre-drag only
+        self.line_handle_ids = {}  # key -> (start_handle_cid, end_handle_cid), for extendable lines
         self.static_ids = {}
         self.undo_stack = []
         self.redo_stack = []
         self.drag_key = None
+        self._endpoint_drag = None  # which cut-line endpoint (0/1) is being dragged, if any
         self.bg_photo = None
-        self.bracket_offset = (0.0, 0.0)  # manual nudge, PDF points; (0,0) = calibrated default
-        self.bracket_rotation = 0  # manual rotation in degrees (0/90/180/270); 0 = calibrated default
-        self._bracket_dragging = False
+        # A list, not a single bracket -- some orders need more than one
+        # CNC/CAD reference point. Each entry: {"offset": (dx,dy) PDF points
+        # from the calibrated default, "rotation": 0/90/180/270}. Always at
+        # least one; never let the last one be deleted.
+        self.brackets = [{"offset": (0.0, 0.0), "rotation": 0}]
+        self.bracket_canvas_ids = {}  # bracket index -> canvas line id
+        self._dragging_bracket = None  # index of the bracket currently being dragged, or None
+        self.bar_offset = (0.0, 0.0)  # manual nudge for the Traveler/material bar, PDF points
+        self._bar_dragging = False
+        self.real_page_w = engine.PAGE_W  # actual order-form page size, set per-order in load_*
+        self.real_page_h = engine.PAGE_H
+        self.preview_page = 1  # 1 = order form + editor, 2 = read-only production order preview
+        self._page2_photo = None
+        self.bg_rotation = 0  # manual rotation of the customer drawing itself (0/90/180/270)
+        self.bg_scale = 1.0  # manual resize of the customer drawing itself
+        # tracks whether the user deliberately deleted the auto-added Blue
+        # Traveler flange note for this order, so _sync_flange_note() doesn't
+        # just re-add it on the next field edit -- reset per order load
+        self._flange_note_dismissed = False
 
         self.placeholder = ttk.Label(self, text="Load an order form to see it here", foreground="#777",
                                       background="#eeeeee", relief="sunken", wraplength=340, justify="center")
         self.placeholder.pack(fill="both", expand=True)
 
+        self.page_nav = ttk.Frame(self)
+        self.page1_btn = ttk.Button(self.page_nav, text="◀ Page 1 (order form)", command=lambda: self.show_page(1))
+        self.page1_btn.pack(side="left")
+        self.page2_btn = ttk.Button(self.page_nav, text="Page 2 (production order) ▶", command=lambda: self.show_page(2))
+        self.page2_btn.pack(side="left", padx=(6, 0))
+
         self.toolbar = ttk.Frame(self)
         self.cut_btn = ttk.Button(self.toolbar, text="Add cut-for-shipping line", command=self.toggle_cut_line)
         self.cut_btn.pack(side="left", padx=(0, 4))
         ttk.Button(self.toolbar, text="Add note", command=self.add_note).pack(side="left", padx=4)
+        ttk.Button(self.toolbar, text="Add bracket", command=self.add_bracket).pack(side="left", padx=4)
         self.undo_btn = ttk.Button(self.toolbar, text="Undo", command=self.undo)
         self.undo_btn.pack(side="left", padx=(12, 4))
         self.redo_btn = ttk.Button(self.toolbar, text="Redo", command=self.redo)
@@ -283,6 +295,7 @@ class InteractiveLayout(ttk.Frame):
     # -- state / visibility --------------------------------------------------
     def show_placeholder(self, text):
         self.loaded = False
+        self.page_nav.pack_forget()
         self.toolbar.pack_forget()
         self.hint.pack_forget()
         self.canvas_frame.pack_forget()
@@ -291,9 +304,116 @@ class InteractiveLayout(ttk.Frame):
 
     def _show_canvas_ui(self):
         self.placeholder.pack_forget()
-        self.toolbar.pack(fill="x", pady=(0, 4))
-        self.hint.pack(fill="x", pady=(0, 4))
+        self.page_nav.pack(fill="x", pady=(0, 4))
         self.canvas_frame.pack(fill="both", expand=True)
+        self._update_page_nav()
+        if self.preview_page == 1:
+            self.toolbar.pack(fill="x", pady=(0, 4), before=self.canvas_frame)
+            self.hint.pack(fill="x", pady=(0, 4), before=self.canvas_frame)
+
+    def _update_page_nav(self):
+        self.page1_btn.state(["disabled"] if self.preview_page == 1 else ["!disabled"])
+        self.page2_btn.state(["disabled"] if self.preview_page == 2 else ["!disabled"])
+
+    def show_page(self, page_num):
+        """Switch the live preview between page 1 (order form + the
+        interactive editor) and page 2 (a read-only preview of the
+        production order, rotated 90 -- matching the final merged output).
+        Only meaningful once an order form is loaded."""
+        if not self.order_form_path:
+            return
+        self.preview_page = page_num
+        self._update_page_nav()
+        if page_num == 1:
+            self.toolbar.pack(fill="x", pady=(0, 4), before=self.canvas_frame)
+            self.hint.pack(fill="x", pady=(0, 4), before=self.canvas_frame)
+            self._draw_page1()
+        else:
+            self.toolbar.pack_forget()
+            self.hint.pack_forget()
+            self._draw_page2()
+
+    def _draw_page1(self):
+        if self.bg_photo is None:
+            return
+        self.canvas.delete("all")
+        self.canvas.config(width=min(self.bg_photo.width(), 420), height=min(self.bg_photo.height(), 640),
+                            scrollregion=(0, 0, self.bg_photo.width(), self.bg_photo.height()))
+        bg_id = self.canvas.create_image(0, 0, anchor="nw", image=self.bg_photo)
+        self.canvas.tag_bind(bg_id, "<Button-2>", self._bg_context_menu)
+        self.canvas.tag_bind(bg_id, "<Button-3>", self._bg_context_menu)
+        self.canvas_ids = {}
+        self.cover_ids = {}
+        self.fixed_cover_ids = {}
+        self.line_handle_ids = {}
+        self.static_ids = {}
+        for item in self.items:
+            self._draw_item(item)
+        self._draw_static_bar_and_bracket()
+
+    # -- rotating/resizing the customer drawing itself (not an overlay item,
+    #    the background scan) -- useful for a simple drawing scanned
+    #    sideways or awkwardly small/large on the page. Dimension items etc.
+    #    stay where they are in the page's own coordinate space and may need
+    #    to be dragged back into place afterward; they don't rotate along
+    #    with the drawing. ------------------------------------------------
+    def _bg_context_menu(self, event):
+        if not self.order_form_path:
+            return
+        menu = tk.Menu(self, tearoff=0)
+        menu.add_command(label="Rotate drawing 90°", command=self._rotate_background)
+        menu.add_command(label="Make drawing bigger (+10%)", command=lambda: self._resize_background(1.1))
+        menu.add_command(label="Make drawing smaller (-10%)", command=lambda: self._resize_background(0.9))
+        if self.bg_rotation != 0 or abs(self.bg_scale - 1.0) > 0.001:
+            menu.add_command(label="Reset drawing rotation/size", command=self._reset_background_transform)
+        menu.tk_popup(event.x_root, event.y_root)
+
+    def _reload_background(self):
+        try:
+            pil_img, real_page_w, real_page_h = self._render_background(self.order_form_path)
+        except Exception as e:
+            traceback.print_exc()
+            messagebox.showerror("Couldn't apply", f"Couldn't re-render the drawing: {e}")
+            return
+        self.real_page_w, self.real_page_h = real_page_w, real_page_h
+        self.bg_photo = ImageTk.PhotoImage(pil_img)
+        if self.preview_page == 1:
+            self._draw_page1()
+
+    def _rotate_background(self):
+        self.bg_rotation = (self.bg_rotation + 90) % 360
+        self._reload_background()
+
+    def _resize_background(self, factor):
+        self.bg_scale = max(0.3, min(3.0, self.bg_scale * factor))
+        self._reload_background()
+
+    def _reset_background_transform(self):
+        self.bg_rotation = 0
+        self.bg_scale = 1.0
+        self._reload_background()
+
+    def _draw_page2(self):
+        if not self.production_order_path or not os.path.isfile(self.production_order_path):
+            self.canvas.delete("all")
+            self.canvas.create_text(10, 10, anchor="nw", text="No production order PDF loaded yet.")
+            return
+        try:
+            pdf = pdfium.PdfDocument(self.production_order_path)
+            page = pdf[0]
+            bitmap = page.render(scale=CANVAS_SCALE)
+            pil_img = bitmap.to_pil().rotate(-90, expand=True)  # matches the final output's page-2 rotation
+            pdf.close()
+        except Exception as e:
+            traceback.print_exc()
+            self.canvas.delete("all")
+            self.canvas.create_text(10, 10, anchor="nw", text=f"Couldn't render page 2: {e}")
+            return
+        self._page2_photo = ImageTk.PhotoImage(pil_img)  # keep a reference so it isn't garbage-collected
+        self.canvas.delete("all")
+        self.canvas.config(width=min(pil_img.width, 420), height=min(pil_img.height, 640),
+                            scrollregion=(0, 0, pil_img.width, pil_img.height))
+        self.canvas.create_image(0, 0, anchor="nw", image=self._page2_photo)
 
     def matches(self, order_form_path, production_order_path):
         return (self.loaded and self.order_form_path == order_form_path
@@ -302,30 +422,56 @@ class InteractiveLayout(ttk.Frame):
     def get_items(self):
         return self.items
 
-    def get_bracket_offset(self):
-        return self.bracket_offset
+    def get_brackets(self):
+        return self.brackets
 
-    def get_bracket_rotation(self):
-        return self.bracket_rotation
+    def get_bar_offset(self):
+        return self.bar_offset
 
     # -- coordinate conversion ------------------------------------------------
+    # Every calibrated item coordinate (PROFILES, dragged positions) lives in
+    # a fixed canonical Letter-space (engine.PAGE_W x engine.PAGE_H), but the
+    # actual order-form page being shown/dragged over might be a different
+    # real size (landscape photo, A4 scan, etc. -- ensure_pdf() no longer
+    # forces it to Letter, to avoid distorting the scan). self.real_page_w/h
+    # track that real size; these conversions scale between the two spaces
+    # so dragging stays visually accurate against the true background while
+    # item positions stay in the canonical space merge_pdf() scales onto the
+    # real page at export time.
     def _pdf_to_canvas(self, x, y):
-        return x * CANVAS_SCALE, (engine.PAGE_H - y) * CANVAS_SCALE
+        sx = self.real_page_w / engine.PAGE_W
+        sy = self.real_page_h / engine.PAGE_H
+        real_x, real_y = x * sx, y * sy
+        return real_x * CANVAS_SCALE, (self.real_page_h - real_y) * CANVAS_SCALE
 
     def _canvas_to_pdf_delta(self, dcx, dcy):
-        return dcx / CANVAS_SCALE, -dcy / CANVAS_SCALE
+        sx = self.real_page_w / engine.PAGE_W
+        sy = self.real_page_h / engine.PAGE_H
+        real_dx, real_dy = dcx / CANVAS_SCALE, -dcy / CANVAS_SCALE
+        return real_dx / sx, real_dy / sy
 
     # -- loading ---------------------------------------------------------------
+    def _render_background(self, order_form_path):
+        """Render order_form_path (through get_transformed_order_form(), so
+        any manual rotate/resize the user applied to the drawing is
+        included) to a PIL image, plus its real page size. Shared by the
+        two load_* methods and _reload_background()."""
+        transformed_path = engine.get_transformed_order_form(order_form_path, self.bg_rotation, self.bg_scale)
+        pdf = pdfium.PdfDocument(transformed_path)
+        page = pdf[0]
+        real_page_w, real_page_h = page.get_size()
+        bitmap = page.render(scale=CANVAS_SCALE)
+        pil_img = bitmap.to_pil()
+        pdf.close()
+        return pil_img, real_page_w, real_page_h
+
     def load_background_only(self, order_form_path):
         """Order form picked, but no valid profile yet (production order not
         read/recognized) -- show just the background, no items."""
+        self.bg_rotation = 0
+        self.bg_scale = 1.0
         try:
-            order_form_pdf_path = engine.ensure_pdf(order_form_path)
-            pdf = pdfium.PdfDocument(order_form_pdf_path)
-            page = pdf[0]
-            bitmap = page.render(scale=CANVAS_SCALE)
-            pil_img = bitmap.to_pil()
-            pdf.close()
+            pil_img, real_page_w, real_page_h = self._render_background(order_form_path)
         except Exception as e:
             traceback.print_exc()
             self.show_placeholder(f"Couldn't render a preview of this file ({type(e).__name__}: {e})")
@@ -335,28 +481,25 @@ class InteractiveLayout(ttk.Frame):
         self.order_form_path = order_form_path
         self.production_order_path = None
         self.profile = None
+        self.real_page_w, self.real_page_h = real_page_w, real_page_h
         self.items = []
         self.bg_photo = ImageTk.PhotoImage(pil_img)
-        img_w, img_h = pil_img.width, pil_img.height
+        self.preview_page = 1
         self._show_canvas_ui()
-        self.canvas.delete("all")
-        self.canvas.config(width=min(img_w, 420), height=min(img_h, 640), scrollregion=(0, 0, img_w, img_h))
-        self.canvas.create_image(0, 0, anchor="nw", image=self.bg_photo)
-        self.canvas_ids = {}
-        self.static_ids = {}
+        self._draw_page1()
         return True
 
     def load_new_order(self, order_form_path, production_order_path, profile, material,
-                        oversize_w, oversize_h, thickness, wide_origin):
+                        oversize_w, oversize_h, thickness, wide_origin, restore_state=None):
         """A genuinely different order (or first load) -- resets items,
-        undo history, and the cut-line state."""
+        undo history, and the cut-line state to fresh defaults, unless
+        restore_state is given (reopening a recent order for a quick edit --
+        see get_recent_order_layout_state()/SingleOrderTab.open_recent_order),
+        in which case the previously saved markup is put back instead."""
+        self.bg_rotation = restore_state["bg_rotation"] if restore_state else 0
+        self.bg_scale = restore_state["bg_scale"] if restore_state else 1.0
         try:
-            order_form_pdf_path = engine.ensure_pdf(order_form_path)
-            pdf = pdfium.PdfDocument(order_form_pdf_path)
-            page = pdf[0]
-            bitmap = page.render(scale=CANVAS_SCALE)
-            pil_img = bitmap.to_pil()
-            pdf.close()
+            pil_img, real_page_w, real_page_h = self._render_background(order_form_path)
         except Exception as e:
             traceback.print_exc()
             self.show_placeholder(f"Couldn't render a preview of this file ({type(e).__name__}: {e})")
@@ -365,32 +508,55 @@ class InteractiveLayout(ttk.Frame):
         self.order_form_path = order_form_path
         self.production_order_path = production_order_path
         self.profile = profile
+        self.real_page_w, self.real_page_h = real_page_w, real_page_h
         self.material = material
         self.oversize_w = oversize_w
         self.oversize_h = oversize_h
         self.wide_origin = wide_origin
-        self.has_cut_line = False
-        self.bracket_offset = (0.0, 0.0)
-        self.bracket_rotation = 0
+        self.bracket_canvas_ids = {}
         self.undo_stack = []
         self.redo_stack = []
-        self.items = engine.compute_default_items(profile, oversize_w, oversize_h, thickness=thickness)
+        if restore_state:
+            self.has_cut_line = restore_state["has_cut_line"]
+            self.brackets = copy.deepcopy(restore_state["brackets"])
+            self.bar_offset = restore_state["bar_offset"]
+            self.items = copy.deepcopy(restore_state["items"])
+            # infer whether the flange note was deliberately dismissed in the
+            # saved markup (Blue Traveler but no flange note present), so
+            # sync() doesn't immediately re-add it against the restored state
+            self._flange_note_dismissed = (
+                engine.is_blue_traveler(material)
+                and not any(i["key"] == engine.FLANGE_NOTE_KEY for i in self.items)
+            )
+        else:
+            self.has_cut_line = False
+            self.brackets = [{"offset": (0.0, 0.0), "rotation": 0}]
+            self.bar_offset = (0.0, 0.0)
+            self.items = engine.compute_default_items(profile, oversize_w, oversize_h, thickness=thickness)
+            self._flange_note_dismissed = False
+            self._sync_flange_note(material)
 
         self.bg_photo = ImageTk.PhotoImage(pil_img)
-        img_w, img_h = pil_img.width, pil_img.height
+        self.preview_page = 1
         self._show_canvas_ui()
-        self.canvas.delete("all")
-        self.canvas.config(width=min(img_w, 420), height=min(img_h, 640), scrollregion=(0, 0, img_w, img_h))
-        self.canvas.create_image(0, 0, anchor="nw", image=self.bg_photo)
-        self.canvas_ids = {}
-        self.static_ids = {}
-        for item in self.items:
-            self._draw_item(item)
-        self._draw_static_bar_and_bracket()
-        self.cut_btn.config(text="Add cut-for-shipping line")
+        self._draw_page1()
+        self.cut_btn.config(text="Remove cut-for-shipping line" if self.has_cut_line else "Add cut-for-shipping line")
         self._update_undo_redo_buttons()
         self.loaded = True
         return True
+
+    def get_recent_order_layout_state(self):
+        """Full live-editor markup state for persisting to the recent-orders
+        list -- everything load_new_order()'s restore_state needs to put the
+        exact same markup back when this order is reopened later."""
+        return {
+            "items": copy.deepcopy(self.items),
+            "brackets": copy.deepcopy(self.brackets),
+            "bar_offset": list(self.bar_offset),
+            "has_cut_line": self.has_cut_line,
+            "bg_rotation": self.bg_rotation,
+            "bg_scale": self.bg_scale,
+        }
 
     def sync(self, material, oversize_w, oversize_h, thickness, wide_origin):
         """Same order, just a material/thickness/curb-depth field changed --
@@ -400,45 +566,78 @@ class InteractiveLayout(ttk.Frame):
             return
         self.material = material
         self.wide_origin = wide_origin
-        self.oversize_w = oversize_w + (engine.CUT_FOR_SHIPPING_EXTRA_IN if self.has_cut_line else 0)
-        self.oversize_h = oversize_h
+        extra_w, extra_h = self._cut_line_bump()
+        self.oversize_w = oversize_w + extra_w
+        self.oversize_h = oversize_h + extra_h
+        # never delete+recreate an item that's actively being dragged -- it
+        # would sever Tkinter's in-progress drag tracking (same class of bug
+        # as the old bracket-redraw-during-motion issue); _refresh_*_text
+        # already guard against that.
         self._refresh_width_text()
-
-        height_item = next((i for i in self.items if i["key"] == "height"), None)
-        if height_item:
-            height_item["text"] = engine.fmt_inches(self.oversize_h)
-            if "height" in self.canvas_ids:
-                self.canvas.itemconfigure(self.canvas_ids["height"], text=height_item["text"])
+        self._refresh_height_text()
 
         thickness_item = next((i for i in self.items if i["key"] == "thickness"), None)
         if thickness and "thickness_text_pos" in self.profile:
             if thickness_item:
-                thickness_item["text"] = thickness
-                if "thickness" in self.canvas_ids:
-                    self.canvas.itemconfigure(self.canvas_ids["thickness"], text=thickness)
+                # go through make_thickness_item so the trailing " stays
+                # consistent, instead of writing the raw field value straight
+                # through and dropping it.
+                thickness_item["text"] = engine.make_thickness_item(self.profile, thickness)["text"]
+                if "thickness" in self.canvas_ids and self.drag_key != "thickness":
+                    self._clear_canvas_for("thickness")
+                    self._draw_item(thickness_item)
             else:
                 new_item = engine.make_thickness_item(self.profile, thickness)
                 self.items.append(new_item)
                 self._draw_item(new_item)
-        elif thickness_item:
-            if "thickness" in self.canvas_ids:
-                self.canvas.delete(self.canvas_ids["thickness"])
-                del self.canvas_ids["thickness"]
+        elif thickness_item and self.drag_key != "thickness":
+            self._clear_canvas_for("thickness")
             self.items.remove(thickness_item)
 
-        self._draw_static_bar_and_bracket()
+        self._sync_flange_note(material)
+
+        if self._dragging_bracket is None and not self._bar_dragging:
+            self._draw_static_bar_and_bracket()
+
+    def _sync_flange_note(self, material):
+        """Blue Traveler orders standardly need a 'FLANGE ON ALL SIDES' note
+        -- auto-add one when that material is selected/detected, same on/off-
+        driven-by-a-field pattern as the thickness item above. Deleting it
+        manually (right-click) marks it dismissed for this order so it won't
+        just come back on the next field edit; picking a different material
+        and back to Blue Traveler again re-offers it (dismissal is cleared as
+        soon as the material isn't Blue Traveler, whether or not there was
+        still a note left to remove at that point)."""
+        needs_flange = engine.is_blue_traveler(material)
+        existing = next((i for i in self.items if i["key"] == engine.FLANGE_NOTE_KEY), None)
+        if not needs_flange:
+            self._flange_note_dismissed = False
+            if existing and self.drag_key != engine.FLANGE_NOTE_KEY:
+                self._clear_canvas_for(engine.FLANGE_NOTE_KEY)
+                self.items.remove(existing)
+            return
+        if not existing and not self._flange_note_dismissed:
+            item = engine.make_flange_note_item()
+            self.items.append(item)
+            if self.loaded:
+                self._draw_item(item)
 
     # -- static (non-draggable) material bar + origin bracket -----------------
     def _draw_static_bar_and_bracket(self):
         for cid in self.static_ids.values():
             self.canvas.delete(cid)
         self.static_ids = {}
+        for cid in self.bracket_canvas_ids.values():
+            self.canvas.delete(cid)
+        self.bracket_canvas_ids = {}
         if not self.profile:
             return
         profile = self.profile
         bar_color = engine.resolve_bar_color(self.material)
         text_color = engine.resolve_text_color(bar_color)
         bx0, by0, bx1, by1 = profile["material_bar"]
+        bdx, bdy = self.bar_offset
+        bx0, by0, bx1, by1 = bx0 + bdx, by0 + bdy, bx1 + bdx, by1 + bdy
         fsize_material = profile["font_size_material"]
         fsize_px = max(8, int(fsize_material * CANVAS_SCALE))
         label_text = (self.material or "").upper()
@@ -453,66 +652,133 @@ class InteractiveLayout(ttk.Frame):
         cx1_default, cy1 = self._pdf_to_canvas(bx1, by0)
         bar_w_px = max(cx1_default - cx0, text_w_px + pad_px * 2)
         cx1 = cx0 + bar_w_px
+        bar_manually_adjusted = self.bar_offset != (0.0, 0.0)
         self.static_ids["bar"] = self.canvas.create_rectangle(
-            cx0, cy0, cx1, cy1, fill=_color_to_hex(bar_color), outline=""
+            cx0, cy0, cx1, cy1, fill=_color_to_hex(bar_color), outline="#d81b60" if bar_manually_adjusted else "",
+            width=2 if bar_manually_adjusted else 0,
         )
         mx, _my = profile["material_text_pos"]
+        mx += bdx
         baseline_y_pdf = (by0 + by1) / 2 - fsize_material * 0.35
         tcx, tcy = self._pdf_to_canvas(mx, baseline_y_pdf)
         self.static_ids["bar_text"] = self.canvas.create_text(
             tcx, tcy, text=label_text, fill=_color_to_hex(text_color),
             font=("Helvetica", fsize_px, "bold"), anchor="sw", justify="left",
         )
-        pts = profile["bracket_wide"] if (self.wide_origin and "bracket_wide" in profile) else profile["bracket"]
-        dx_off, dy_off = self.bracket_offset
-        pdf_pts = [(px + dx_off, py + dy_off) for px, py in pts]
-        if self.bracket_rotation:
-            pivot = pdf_pts[1]  # the elbow -- the actual corner vertex the bracket marks
-            pdf_pts = [engine.rotate_point(pt, pivot, self.bracket_rotation) for pt in pdf_pts]
-        flat_pts = []
-        for px, py in pdf_pts:
-            cx, cy = self._pdf_to_canvas(px, py)
-            flat_pts.extend([cx, cy])
-        manually_adjusted = self.bracket_offset != (0.0, 0.0) or self.bracket_rotation != 0
-        bracket_color = "#d81b60" if manually_adjusted else "#f2842f"  # flag a manual nudge/rotation
-        cid = self.canvas.create_line(
-            *flat_pts, fill=bracket_color, width=max(2, int(profile["bracket_width"] * CANVAS_SCALE))
-        )
-        self.static_ids["bracket"] = cid
+        # the material/Traveler bar is draggable too -- in case it ends up
+        # covering something on the order form it shouldn't.
+        for cid in (self.static_ids["bar"], self.static_ids["bar_text"]):
+            self.canvas.tag_bind(cid, "<ButtonPress-1>", self._bar_press)
+            self.canvas.tag_bind(cid, "<B1-Motion>", self._bar_motion)
+            self.canvas.tag_bind(cid, "<ButtonRelease-1>", self._bar_release)
+            self.canvas.tag_bind(cid, "<Button-2>", self._bar_context_menu)
+            self.canvas.tag_bind(cid, "<Button-3>", self._bar_context_menu)
         # the origin bracket IS draggable -- calibration can be wrong for a
-        # given order/product, and there's no other way to correct it
-        self.canvas.tag_bind(cid, "<ButtonPress-1>", self._bracket_press)
-        self.canvas.tag_bind(cid, "<B1-Motion>", self._bracket_motion)
-        self.canvas.tag_bind(cid, "<ButtonRelease-1>", self._bracket_release)
-        self.canvas.tag_bind(cid, "<Button-2>", self._bracket_context_menu)
-        self.canvas.tag_bind(cid, "<Button-3>", self._bracket_context_menu)
+        # given order/product, and there's no other way to correct it. Not
+        # just one either: some orders need more than one CNC/CAD reference
+        # point, so this loops over self.brackets (always at least one).
+        base_pts = profile["bracket_wide"] if (self.wide_origin and "bracket_wide" in profile) else profile["bracket"]
+        for i, bracket in enumerate(self.brackets):
+            dx_off, dy_off = bracket["offset"]
+            rotation = bracket["rotation"]
+            pdf_pts = [(px + dx_off, py + dy_off) for px, py in base_pts]
+            if rotation:
+                pivot = pdf_pts[1]  # the elbow -- the actual corner vertex the bracket marks
+                pdf_pts = [engine.rotate_point(pt, pivot, rotation) for pt in pdf_pts]
+            flat_pts = []
+            for px, py in pdf_pts:
+                cx, cy = self._pdf_to_canvas(px, py)
+                flat_pts.extend([cx, cy])
+            manually_adjusted = bracket["offset"] != (0.0, 0.0) or rotation != 0
+            bracket_color = "#d81b60" if manually_adjusted else ITEM_COLOR_HEX["orange"]  # flag a manual nudge/rotation
+            cid = self.canvas.create_line(
+                *flat_pts, fill=bracket_color, width=max(2, int(profile["bracket_width"] * CANVAS_SCALE))
+            )
+            self.bracket_canvas_ids[i] = cid
+            self.canvas.tag_bind(cid, "<ButtonPress-1>", lambda e, idx=i: self._bracket_press(e, idx))
+            self.canvas.tag_bind(cid, "<B1-Motion>", lambda e, idx=i: self._bracket_motion(e, idx))
+            self.canvas.tag_bind(cid, "<ButtonRelease-1>", lambda e: self._bracket_release())
+            self.canvas.tag_bind(cid, "<Button-2>", lambda e, idx=i: self._bracket_context_menu(e, idx))
+            self.canvas.tag_bind(cid, "<Button-3>", lambda e, idx=i: self._bracket_context_menu(e, idx))
         for other_cid in self.canvas_ids.values():
             self.canvas.tag_raise(other_cid)  # keep draggable items above the bar/bracket
 
     # -- drawing draggable items -----------------------------------------------
+    def _clear_canvas_for(self, key):
+        """Delete every canvas object (text + cover boxes + line endpoint
+        handles) tied to a key, without touching self.items."""
+        for d in (self.canvas_ids, self.cover_ids, self.fixed_cover_ids):
+            cid = d.pop(key, None)
+            if cid is not None:
+                self.canvas.delete(cid)
+        handles = self.line_handle_ids.pop(key, None)
+        if handles:
+            for h in handles:
+                self.canvas.delete(h)
+
     def _draw_item(self, item):
         key = item["key"]
         if item["kind"] == "line":
-            x1, y1 = self._pdf_to_canvas(item["x"], item["y0"])
-            x2, y2 = self._pdf_to_canvas(item["x"], item["y1"])
+            cx0, cy0 = self._pdf_to_canvas(item["x0"], item["y0"])
+            cx1, cy1 = self._pdf_to_canvas(item["x1"], item["y1"])
+            color_hex = ITEM_COLOR_HEX.get(item["color"], ITEM_COLOR_HEX["orange"])
             cid = self.canvas.create_line(
-                x1, y1, x2, y2, fill=ITEM_COLOR_HEX.get(item["color"], "#f2842f"),
+                cx0, cy0, cx1, cy1, fill=color_hex,
                 width=4, dash=(6, 4) if item.get("dashed") else None,
             )
+            targets = (cid,)
+            if key == "cut_line":
+                # small draggable handles at each end so the line can be
+                # extended/shortened, not just moved as a whole
+                r = 5
+                h0 = self.canvas.create_oval(cx0 - r, cy0 - r, cx0 + r, cy0 + r, fill=color_hex, outline="")
+                h1 = self.canvas.create_oval(cx1 - r, cy1 - r, cx1 + r, cy1 + r, fill=color_hex, outline="")
+                self.canvas.tag_bind(h0, "<ButtonPress-1>", lambda e: self._cutline_endpoint_press(e, 0))
+                self.canvas.tag_bind(h0, "<B1-Motion>", lambda e: self._cutline_endpoint_motion(e, 0))
+                self.canvas.tag_bind(h0, "<ButtonRelease-1>", lambda e: self._cutline_endpoint_release())
+                self.canvas.tag_bind(h1, "<ButtonPress-1>", lambda e: self._cutline_endpoint_press(e, 1))
+                self.canvas.tag_bind(h1, "<B1-Motion>", lambda e: self._cutline_endpoint_motion(e, 1))
+                self.canvas.tag_bind(h1, "<ButtonRelease-1>", lambda e: self._cutline_endpoint_release())
+                self.line_handle_ids[key] = (h0, h1)
         else:
             cx, cy = self._pdf_to_canvas(item["x"], item["y"])
             fsize_px = max(8, int(item["font_size"] * CANVAS_SCALE))
+            tk_font = tkfont.Font(family="Helvetica", size=fsize_px, weight="bold")
+            lines = item["text"].split("\n")
+            text_w = max((tk_font.measure(ln) for ln in lines), default=0)
+            text_h = tk_font.metrics("linespace") * len(lines)
+            pad = 4
+            # Match the final PDF's white-cover-box behavior (kbrs_markup.py's
+            # render_page): a calibrated box blanking the original scanned
+            # value (only until the item is moved), plus a padded box that
+            # always follows the text itself so it stays legible over any
+            # background -- the live preview previously drew neither, so
+            # orange text could get lost against a busy scan.
+            if item.get("fixed_cover") and not item.get("moved"):
+                fx0, fy0, fx1, fy1 = item["fixed_cover"]
+                fcx0, fcy0 = self._pdf_to_canvas(fx0, fy0)
+                fcx1, fcy1 = self._pdf_to_canvas(fx1, fy1)
+                self.fixed_cover_ids[key] = self.canvas.create_rectangle(
+                    fcx0, fcy0, fcx1, fcy1, fill="white", outline=""
+                )
+            cover_id = self.canvas.create_rectangle(
+                cx - pad, cy + pad, cx + text_w + pad, cy - text_h - pad,
+                fill="white", outline=""
+            )
+            self.cover_ids[key] = cover_id
             cid = self.canvas.create_text(
                 cx, cy, text=item["text"],
-                fill=ITEM_COLOR_HEX.get(item["color"], "#f2842f"),
+                fill=ITEM_COLOR_HEX.get(item["color"], ITEM_COLOR_HEX["orange"]),
                 font=("Helvetica", fsize_px, "bold"), anchor="sw", justify="left",
             )
+            targets = (cid,)  # cover_id is purely visual, not its own drag target
         self.canvas_ids[key] = cid
-        self.canvas.tag_bind(cid, "<ButtonPress-1>", lambda e, k=key: self._press(e, k))
-        self.canvas.tag_bind(cid, "<B1-Motion>", lambda e, k=key: self._motion(e, k))
-        self.canvas.tag_bind(cid, "<ButtonRelease-1>", lambda e: self._release())
-        self.canvas.tag_bind(cid, "<Button-2>", lambda e, k=key: self._context_menu(e, k))
-        self.canvas.tag_bind(cid, "<Button-3>", lambda e, k=key: self._context_menu(e, k))
+        for target in targets:
+            self.canvas.tag_bind(target, "<ButtonPress-1>", lambda e, k=key: self._press(e, k))
+            self.canvas.tag_bind(target, "<B1-Motion>", lambda e, k=key: self._motion(e, k))
+            self.canvas.tag_bind(target, "<ButtonRelease-1>", lambda e: self._release())
+            self.canvas.tag_bind(target, "<Button-2>", lambda e, k=key: self._context_menu(e, k))
+            self.canvas.tag_bind(target, "<Button-3>", lambda e, k=key: self._context_menu(e, k))
 
     def _item(self, key):
         return next(i for i in self.items if i["key"] == key)
@@ -536,10 +802,21 @@ class InteractiveLayout(ttk.Frame):
         cid = self.canvas_ids[key]
         dx_pdf, dy_pdf = self._canvas_to_pdf_delta(dx_px, dy_px)
         if item["kind"] == "line":
-            self.canvas.move(cid, dx_px, 0)
-            item["x"] += dx_pdf
+            self.canvas.move(cid, dx_px, dy_px)
+            item["x0"] += dx_pdf
+            item["y0"] += dy_pdf
+            item["x1"] += dx_pdf
+            item["y1"] += dy_pdf
+            for h in self.line_handle_ids.get(key, ()):
+                self.canvas.move(h, dx_px, dy_px)
         else:
             self.canvas.move(cid, dx_px, dy_px)
+            cover_id = self.cover_ids.get(key)
+            if cover_id is not None:
+                self.canvas.move(cover_id, dx_px, dy_px)
+            fixed_cover_id = self.fixed_cover_ids.pop(key, None)
+            if fixed_cover_id is not None:
+                self.canvas.delete(fixed_cover_id)  # matches render_page: only shown pre-move
             item["x"] += dx_pdf
             item["y"] += dy_pdf
             item["moved"] = True
@@ -547,47 +824,182 @@ class InteractiveLayout(ttk.Frame):
     def _release(self):
         self.drag_key = None
 
-    # -- origin bracket (draggable, since calibration can be off for a given
-    #    product/order and there's no other way to correct it) -------------
-    def _bracket_press(self, event):
+    # -- cut-line endpoint handles (extend/shorten the line, as opposed to
+    #    _press/_motion/_release above which move the whole line) ----------
+    def _cutline_endpoint_press(self, event, which):
         self.canvas.focus_set()
-        self._bracket_dragging = True
+        self._endpoint_drag = which
         self._last_xy = (event.x, event.y)
         self._drag_snapshotted = False
 
-    def _bracket_motion(self, event):
-        if not self._bracket_dragging:
+    def _cutline_endpoint_motion(self, event, which):
+        if self._endpoint_drag != which:
             return
         if not self._drag_snapshotted:
-            self._push_undo()  # snapshot the pre-drag position, once per drag
+            self._push_undo()
             self._drag_snapshotted = True
         dx_px = event.x - self._last_xy[0]
         dy_px = event.y - self._last_xy[1]
         self._last_xy = (event.x, event.y)
+        item = self._item("cut_line")
         dx_pdf, dy_pdf = self._canvas_to_pdf_delta(dx_px, dy_px)
-        ox, oy = self.bracket_offset
-        self.bracket_offset = (ox + dx_pdf, oy + dy_pdf)
-        self._draw_static_bar_and_bracket()
+        xkey, ykey = ("x0", "y0") if which == 0 else ("x1", "y1")
+        item[xkey] += dx_pdf
+        item[ykey] += dy_pdf
+        # move just this handle and update the line's coords in place --
+        # never delete+recreate mid-drag (see _bracket_motion for why that
+        # breaks Tk's in-progress drag tracking).
+        handles = self.line_handle_ids.get("cut_line")
+        if handles:
+            self.canvas.move(handles[which], dx_px, dy_px)
+        line_cid = self.canvas_ids.get("cut_line")
+        if line_cid is not None:
+            ncx0, ncy0 = self._pdf_to_canvas(item["x0"], item["y0"])
+            ncx1, ncy1 = self._pdf_to_canvas(item["x1"], item["y1"])
+            self.canvas.coords(line_cid, ncx0, ncy0, ncx1, ncy1)
+
+    def _cutline_endpoint_release(self, event=None):
+        self._endpoint_drag = None
+
+    # -- origin bracket (draggable, since calibration can be off for a given
+    #    product/order and there's no other way to correct it; more than one
+    #    can exist for orders that need multiple CNC/CAD reference points) --
+    def _bracket_press(self, event, index):
+        self.canvas.focus_set()
+        self._dragging_bracket = index
+        self._last_xy = (event.x, event.y)
+        self._drag_snapshotted = False
+
+    def _bracket_motion(self, event, index):
+        if self._dragging_bracket != index:
+            return
+        cid = self.bracket_canvas_ids.get(index)
+        if not self._drag_snapshotted:
+            self._push_undo()  # snapshot the pre-drag position, once per drag
+            self._drag_snapshotted = True
+            if cid is not None:
+                # set the "manually nudged" color once, on the first motion
+                # event of the drag, not every single one -- itemconfig() on
+                # every pixel of movement was adding needless per-frame cost
+                # and made dragging feel sluggish.
+                self.canvas.itemconfig(cid, fill="#d81b60")
+        dx_px = event.x - self._last_xy[0]
+        dy_px = event.y - self._last_xy[1]
+        self._last_xy = (event.x, event.y)
+        dx_pdf, dy_pdf = self._canvas_to_pdf_delta(dx_px, dy_px)
+        ox, oy = self.brackets[index]["offset"]
+        self.brackets[index]["offset"] = (ox + dx_pdf, oy + dy_pdf)
+        # Move the existing canvas item in place (like _motion does for every
+        # other draggable item) instead of a full _draw_static_bar_and_bracket()
+        # redraw. A redraw deletes and recreates the item with a new id and
+        # fresh bindings on every motion event, which breaks Tkinter's
+        # in-progress drag tracking (tied to the original item) and stalls
+        # the drag right after it starts.
+        if cid is not None:
+            self.canvas.move(cid, dx_px, dy_px)
 
     def _bracket_release(self, event=None):
-        self._bracket_dragging = False
+        self._dragging_bracket = None
 
-    def _bracket_context_menu(self, event):
+    def _bracket_context_menu(self, event, index):
+        bracket = self.brackets[index]
         menu = tk.Menu(self, tearoff=0)
-        menu.add_command(label="Rotate 90°", command=self._rotate_bracket)
-        if self.bracket_offset != (0.0, 0.0) or self.bracket_rotation != 0:
-            menu.add_command(label="Reset origin position", command=self._reset_bracket_offset)
+        menu.add_command(label="Rotate 90°", command=lambda: self._rotate_bracket(index, 90))
+        # 45-degree step, separate from the 90 above -- for neo-angle/odd
+        # showers where the true CNC/CAD origin corner doesn't land on a
+        # clean 90-degree turn and 90-only rotation can't line it up.
+        menu.add_command(label="Rotate 45°", command=lambda: self._rotate_bracket(index, 45))
+        menu.add_command(label="Duplicate this bracket", command=lambda: self._duplicate_bracket(index))
+        if bracket["offset"] != (0.0, 0.0) or bracket["rotation"] != 0:
+            menu.add_command(label="Reset this bracket's position", command=lambda: self._reset_bracket_offset(index))
+        if len(self.brackets) > 1:
+            menu.add_command(label="Delete this bracket", command=lambda: self._delete_bracket(index))
         menu.tk_popup(event.x_root, event.y_root)
 
-    def _rotate_bracket(self):
+    def _rotate_bracket(self, index, step=90):
         self._push_undo()
-        self.bracket_rotation = (self.bracket_rotation + 90) % 360
+        self.brackets[index]["rotation"] = (self.brackets[index]["rotation"] + step) % 360
         self._draw_static_bar_and_bracket()
 
-    def _reset_bracket_offset(self):
+    def _reset_bracket_offset(self, index):
         self._push_undo()
-        self.bracket_offset = (0.0, 0.0)
-        self.bracket_rotation = 0
+        self.brackets[index]["offset"] = (0.0, 0.0)
+        self.brackets[index]["rotation"] = 0
+        self._draw_static_bar_and_bracket()
+
+    def add_bracket(self):
+        """A fresh, un-adjusted bracket at the calibrated default position --
+        for an order that needs a second independent reference point rather
+        than a copy of one that's already been repositioned."""
+        if not self.loaded:
+            return
+        self._push_undo()
+        self.brackets.append({"offset": (0.0, 0.0), "rotation": 0})
+        self._draw_static_bar_and_bracket()
+
+    def _duplicate_bracket(self, index):
+        self._push_undo()
+        src = self.brackets[index]
+        # nudge slightly so the copy doesn't sit exactly on top of the
+        # original, making it obvious there are now two and easy to grab
+        ox, oy = src["offset"]
+        self.brackets.append({"offset": (ox + 20.0, oy - 20.0), "rotation": src["rotation"]})
+        self._draw_static_bar_and_bracket()
+
+    def _delete_bracket(self, index):
+        if len(self.brackets) <= 1:
+            return  # always keep at least one -- it's the CNC/CAD reference point
+        self._push_undo()
+        del self.brackets[index]
+        self._draw_static_bar_and_bracket()
+
+    # -- material/Traveler bar (draggable, in case it covers something on the
+    #    order form it shouldn't) --------------------------------------------
+    def _bar_press(self, event):
+        self.canvas.focus_set()
+        self._bar_dragging = True
+        self._last_xy = (event.x, event.y)
+        self._drag_snapshotted = False
+
+    def _bar_motion(self, event):
+        if not self._bar_dragging:
+            return
+        if not self._drag_snapshotted:
+            self._push_undo()
+            self._drag_snapshotted = True
+            bar_cid = self.static_ids.get("bar")
+            if bar_cid is not None:
+                # once per drag, not once per motion event -- see the
+                # matching comment in _bracket_motion.
+                self.canvas.itemconfig(bar_cid, outline="#d81b60", width=2)
+        dx_px = event.x - self._last_xy[0]
+        dy_px = event.y - self._last_xy[1]
+        self._last_xy = (event.x, event.y)
+        dx_pdf, dy_pdf = self._canvas_to_pdf_delta(dx_px, dy_px)
+        ox, oy = self.bar_offset
+        self.bar_offset = (ox + dx_pdf, oy + dy_pdf)
+        # Move the existing items in place rather than a full redraw -- see
+        # the comment in _bracket_motion for why a redraw mid-drag breaks
+        # Tkinter's drag tracking.
+        for key in ("bar", "bar_text"):
+            cid = self.static_ids.get(key)
+            if cid is not None:
+                self.canvas.move(cid, dx_px, dy_px)
+
+    def _bar_release(self, event=None):
+        self._bar_dragging = False
+
+    def _bar_context_menu(self, event):
+        menu = tk.Menu(self, tearoff=0)
+        if self.bar_offset != (0.0, 0.0):
+            menu.add_command(label="Reset Traveler bar position", command=self._reset_bar_offset)
+        else:
+            menu.add_command(label="(drag the bar to move it)", state="disabled")
+        menu.tk_popup(event.x_root, event.y_root)
+
+    def _reset_bar_offset(self):
+        self._push_undo()
+        self.bar_offset = (0.0, 0.0)
         self._draw_static_bar_and_bracket()
 
     # -- undo/redo -----------------------------------------------------------
@@ -595,9 +1007,10 @@ class InteractiveLayout(ttk.Frame):
         return {
             "items": copy.deepcopy(self.items),
             "oversize_w": self.oversize_w,
+            "oversize_h": self.oversize_h,
             "has_cut_line": self.has_cut_line,
-            "bracket_offset": self.bracket_offset,
-            "bracket_rotation": self.bracket_rotation,
+            "brackets": copy.deepcopy(self.brackets),
+            "bar_offset": self.bar_offset,
         }
 
     def _push_undo(self):
@@ -608,12 +1021,17 @@ class InteractiveLayout(ttk.Frame):
     def _restore(self, snap):
         self.items = copy.deepcopy(snap["items"])
         self.oversize_w = snap["oversize_w"]
+        self.oversize_h = snap.get("oversize_h", self.oversize_h)
         self.has_cut_line = snap["has_cut_line"]
-        self.bracket_offset = snap.get("bracket_offset", (0.0, 0.0))
-        self.bracket_rotation = snap.get("bracket_rotation", 0)
-        for cid in self.canvas_ids.values():
+        self.brackets = copy.deepcopy(snap.get("brackets", [{"offset": (0.0, 0.0), "rotation": 0}]))
+        self.bar_offset = snap.get("bar_offset", (0.0, 0.0))
+        for cid in (list(self.canvas_ids.values()) + list(self.cover_ids.values())
+                    + list(self.fixed_cover_ids.values()) + [h for pair in self.line_handle_ids.values() for h in pair]):
             self.canvas.delete(cid)
         self.canvas_ids = {}
+        self.cover_ids = {}
+        self.fixed_cover_ids = {}
+        self.line_handle_ids = {}
         for item in self.items:
             self._draw_item(item)
         self._draw_static_bar_and_bracket()
@@ -643,11 +1061,52 @@ class InteractiveLayout(ttk.Frame):
         menu = tk.Menu(self, tearoff=0)
         if item.get("editable_text"):
             menu.add_command(label="Edit text…", command=lambda: self._edit_text(key))
+        if key.startswith("note_"):
+            other = "orange" if item.get("color") == "black" else "black"
+            menu.add_command(label=f"Change to {other} text", command=lambda: self._toggle_note_color(key))
+        if key == "cut_line":
+            menu.add_command(label="Rotate 90°", command=self._rotate_cut_line)
         if item.get("deletable"):
             menu.add_command(label="Delete", command=lambda: self._delete_item(key))
         if not item.get("editable_text") and not item.get("deletable"):
             menu.add_command(label="(required item — can't edit or delete)", state="disabled")
         menu.tk_popup(event.x_root, event.y_root)
+
+    def _toggle_note_color(self, key):
+        item = self._item(key)
+        self._push_undo()
+        if item.get("color") == "black":
+            item["color"] = "orange"
+            item["font_size"] = 20
+        else:
+            item["color"] = "black"
+            item["font_size"] = 14
+        self._clear_canvas_for(key)
+        self._draw_item(item)
+
+    def _rotate_cut_line(self):
+        """Swap the cut line between vertical and horizontal, and move its
+        +CUT_FOR_SHIPPING_EXTRA_IN oversize bump to the axis it now runs
+        across -- a horizontal cut affects the height dimension, not width."""
+        item = self._item("cut_line")
+        self._push_undo()
+        cx = (item["x0"] + item["x1"]) / 2
+        cy = (item["y0"] + item["y1"]) / 2
+        pivot = (cx, cy)
+        item["x0"], item["y0"] = engine.rotate_point((item["x0"], item["y0"]), pivot, 90)
+        item["x1"], item["y1"] = engine.rotate_point((item["x1"], item["y1"]), pivot, 90)
+        was_vertical = item.get("orientation") == "vertical"
+        item["orientation"] = "horizontal" if was_vertical else "vertical"
+        if was_vertical:
+            self.oversize_w -= engine.CUT_FOR_SHIPPING_EXTRA_IN
+            self.oversize_h += engine.CUT_FOR_SHIPPING_EXTRA_IN
+        else:
+            self.oversize_h -= engine.CUT_FOR_SHIPPING_EXTRA_IN
+            self.oversize_w += engine.CUT_FOR_SHIPPING_EXTRA_IN
+        self._clear_canvas_for("cut_line")
+        self._draw_item(item)
+        self._refresh_width_text()
+        self._refresh_height_text()
 
     def _edit_text(self, key):
         item = self._item(key)
@@ -657,25 +1116,32 @@ class InteractiveLayout(ttk.Frame):
             return
         self._push_undo()
         item["text"] = new_text.replace("\\n", "\n")
-        self.canvas.itemconfigure(self.canvas_ids[key], text=item["text"])
+        self._clear_canvas_for(key)
+        self._draw_item(item)  # recreate so the cover box resizes to the new text
 
     def _delete_item(self, key, _record_undo=True):
         if _record_undo:
             self._push_undo()
         item = self._item(key)
-        self.canvas.delete(self.canvas_ids[key])
-        del self.canvas_ids[key]
+        self._clear_canvas_for(key)
         self.items.remove(item)
+        if key == engine.FLANGE_NOTE_KEY:
+            self._flange_note_dismissed = True
         if key == "cut_line":
-            # also drop the paired label and revert the width bump
+            # also drop the paired label and revert the oversize bump from
+            # whichever axis it's currently on (may have been rotated since
+            # it was added)
             label = next((i for i in self.items if i["key"] == "cut_label"), None)
             if label:
-                self.canvas.delete(self.canvas_ids["cut_label"])
-                del self.canvas_ids["cut_label"]
+                self._clear_canvas_for("cut_label")
                 self.items.remove(label)
+            if item.get("orientation") == "horizontal":
+                self.oversize_h -= engine.CUT_FOR_SHIPPING_EXTRA_IN
+                self._refresh_height_text()
+            else:
+                self.oversize_w -= engine.CUT_FOR_SHIPPING_EXTRA_IN
+                self._refresh_width_text()
             self.has_cut_line = False
-            self.oversize_w -= engine.CUT_FOR_SHIPPING_EXTRA_IN
-            self._refresh_width_text()
             self.cut_btn.config(text="Add cut-for-shipping line")
 
     # -- toolbar actions -----------------------------------------------------
@@ -689,6 +1155,15 @@ class InteractiveLayout(ttk.Frame):
         for item in engine.make_cut_line_items():
             self.items.append(item)
             self._draw_item(item)
+        # the "Cut for shipping" label's cover box is drawn after (so above)
+        # the line and starts out overlapping it -- without this, a click
+        # right where they overlap silently hits the label's (non-
+        # interactive) cover box instead of the draggable line.
+        line_cid = self.canvas_ids.get("cut_line")
+        if line_cid is not None:
+            self.canvas.tag_raise(line_cid)
+            for h in self.line_handle_ids.get("cut_line", ()):
+                self.canvas.tag_raise(h)
         self.has_cut_line = True
         self.oversize_w += engine.CUT_FOR_SHIPPING_EXTRA_IN
         self._refresh_width_text()
@@ -698,8 +1173,30 @@ class InteractiveLayout(ttk.Frame):
         width_item = next((i for i in self.items if i["key"] == "width"), None)
         if width_item:
             width_item["text"] = engine.fmt_inches(self.oversize_w)
-            if "width" in self.canvas_ids:
-                self.canvas.itemconfigure(self.canvas_ids["width"], text=width_item["text"])
+            if "width" in self.canvas_ids and self.drag_key != "width":
+                self._clear_canvas_for("width")
+                self._draw_item(width_item)
+
+    def _refresh_height_text(self):
+        height_item = next((i for i in self.items if i["key"] == "height"), None)
+        if height_item:
+            height_item["text"] = engine.fmt_inches(self.oversize_h)
+            if "height" in self.canvas_ids and self.drag_key != "height":
+                self._clear_canvas_for("height")
+                self._draw_item(height_item)
+
+    def _cut_line_bump(self):
+        """(extra_w, extra_h) currently added by the cut-for-shipping line,
+        if present -- applied to whichever axis it currently runs across
+        (width if vertical, height if horizontal), not always width."""
+        if not self.has_cut_line:
+            return 0.0, 0.0
+        item = next((i for i in self.items if i["key"] == "cut_line"), None)
+        if item is None:
+            return 0.0, 0.0
+        if item.get("orientation") == "horizontal":
+            return 0.0, engine.CUT_FOR_SHIPPING_EXTRA_IN
+        return engine.CUT_FOR_SHIPPING_EXTRA_IN, 0.0
 
     def add_note(self):
         if not self.loaded:
@@ -707,8 +1204,16 @@ class InteractiveLayout(ttk.Frame):
         text = simpledialog.askstring("Add note", "Note text (use \\n for a line break):", parent=self)
         if not text:
             return
+        use_black = messagebox.askyesno(
+            "Note color",
+            "Use black text (smaller) for this note?\n\nNo = orange, matching the other measurements.",
+            parent=self,
+        )
         self._push_undo()
-        item = engine.make_note_item(text=text.replace("\\n", "\n"))
+        if use_black:
+            item = engine.make_note_item(text=text.replace("\\n", "\n"), color="black", font_size=14)
+        else:
+            item = engine.make_note_item(text=text.replace("\\n", "\n"))
         self.items.append(item)
         self._draw_item(item)
 
@@ -720,27 +1225,56 @@ class SingleOrderTab(ttk.Frame):
         self.production_order_path = tk.StringVar()
         self.material = tk.StringVar()
         self.thickness = tk.StringVar(value="")
+        self.thickness_warning = tk.StringVar(value="")
         self.drain_a = tk.StringVar(value="")
-        self.curb_depth = tk.StringVar(value="4")
-        self.out_dir = tk.StringVar(value=str(Path.home() / "Desktop"))
+        self.curb_depth = tk.StringVar(value="")
+        # Some Tile-Basin orders have a curb on both the width and height
+        # sides (e.g. an L-shaped/corner basin), not just height -- this
+        # varies per order, not by product type, so it's a per-order toggle
+        # rather than baked into the CTB/CLTB profile.
+        self.curb_affects_width = tk.BooleanVar(value=False)
+        # Raw width/height normally come from parsing the production order
+        # PDF's text -- these are the manual fallback/override for when that
+        # parse fails or gets a handwritten/nonstandard order wrong, same
+        # idea as the Drain A field already having a manual fallback.
+        self.raw_width = tk.StringVar(value="")
+        self.raw_height = tk.StringVar(value="")
+        self.product_type_override = tk.StringVar(value="")
+        self.out_dir = tk.StringVar(value=engine.get_default_output_dir() or str(Path.home() / "Desktop"))
         self.out_name = tk.StringVar(value="")
         self.preview_text = tk.StringVar(value="Choose both files, then click Preview.")
         self._preview_after_id = None
         self._last_auto_thickness = None  # tracks our own auto-fills so we don't clobber manual overrides
         self._autoread_attempted_for = None
         self._last_auto_outname = None
+        self._last_auto_raw_width = None
+        self._last_auto_raw_height = None
+        self._pending_restore_state = None  # set by open_recent_order(), consumed by the next load
+        self.on_recent_orders_changed = None  # callback set by main() to refresh the File > Recent Orders menu
 
         outer = ttk.Frame(self)
         outer.pack(fill="both", expand=True)
 
         # Left column is scrollable so the Generate button/status stay
-        # reachable no matter how tall the form gets (window height is
-        # fixed, but the field list has grown over time).
-        left_canvas = tk.Canvas(outer, width=580, highlightthickness=0)
-        left_scrollbar = ttk.Scrollbar(outer, orient="vertical", command=left_canvas.yview)
-        left_canvas.configure(yscrollcommand=left_scrollbar.set)
-        left_canvas.pack(side="left", fill="y")
-        left_scrollbar.pack(side="left", fill="y")
+        # reachable no matter how tall the form gets, and so the panel
+        # doesn't get clipped on a narrower window. A real horizontal
+        # scrollbar is included too, not just vertical -- trackpad/wheel
+        # scroll can be unreliable over native ttk widgets on macOS (the
+        # event doesn't always reach Tk's dispatcher, no binding trick fixes
+        # that), but dragging a scrollbar thumb is a direct, reliable
+        # interaction that doesn't depend on wheel-event delivery at all.
+        left_container = ttk.Frame(outer)
+        left_container.pack(side="left", fill="y")
+        canvas_row = ttk.Frame(left_container)
+        canvas_row.pack(side="top", fill="both", expand=True)
+        left_canvas = tk.Canvas(canvas_row, width=700, highlightthickness=0)
+        left_vscroll = ttk.Scrollbar(canvas_row, orient="vertical", command=left_canvas.yview)
+        left_canvas.configure(yscrollcommand=left_vscroll.set)
+        left_canvas.pack(side="left", fill="both", expand=True)
+        left_vscroll.pack(side="left", fill="y")
+        left_hscroll = ttk.Scrollbar(left_container, orient="horizontal", command=left_canvas.xview)
+        left_canvas.configure(xscrollcommand=left_hscroll.set)
+        left_hscroll.pack(side="bottom", fill="x")
         left = ttk.Frame(left_canvas)
         left_window = left_canvas.create_window((0, 0), window=left, anchor="nw")
 
@@ -748,40 +1282,73 @@ class SingleOrderTab(ttk.Frame):
             left_canvas.configure(scrollregion=left_canvas.bbox("all"))
         left.bind("<Configure>", _sync_scrollregion)
 
+        # A plain bind() on left_canvas/left only fires when the pointer is
+        # directly over empty canvas space -- the panel is packed with real
+        # child widgets (Entry, Combobox, Label...), and Tk delivers
+        # wheel/trackpad events to whichever specific widget is under the
+        # pointer, not bubbled up to ancestors. A bind_all + ancestry-check
+        # didn't reliably fix it either, likely because ttk's own class
+        # bindings for Entry/Combobox on Aqua run before the "all" bindtag
+        # and can swallow the event first. Binding directly on every
+        # descendant widget (below, after the panel is fully built) fires at
+        # the highest-priority instance-binding level, ahead of any class
+        # binding.
         def _on_mousewheel(event):
             delta = event.delta
             if abs(delta) >= 120:  # Windows sends multiples of 120; macOS sends small ints
                 delta //= 120
             left_canvas.yview_scroll(int(-delta), "units")
-        left_canvas.bind("<MouseWheel>", _on_mousewheel)
-        left.bind("<MouseWheel>", _on_mousewheel)
+
+        def _on_shift_mousewheel(event):
+            delta = event.delta
+            if abs(delta) >= 120:
+                delta //= 120
+            left_canvas.xview_scroll(int(-delta), "units")
+
+        def _on_button4(event):
+            left_canvas.yview_scroll(-1, "units")
+
+        def _on_button5(event):
+            left_canvas.yview_scroll(1, "units")
+
+        def _bind_scroll_recursive(widget):
+            widget.bind("<MouseWheel>", _on_mousewheel, add="+")
+            widget.bind("<Shift-MouseWheel>", _on_shift_mousewheel, add="+")
+            widget.bind("<Button-4>", _on_button4, add="+")  # Linux/X11 wheel
+            widget.bind("<Button-5>", _on_button5, add="+")
+            for child in widget.winfo_children():
+                _bind_scroll_recursive(child)
 
         right = ttk.Frame(outer, padding=(20, 0, 0, 0))
         right.pack(side="left", fill="both", expand=True)
 
-        drop_hint = "  (drag & drop onto the box below, or click it)" if DND_AVAILABLE else "  (click the box below to browse)"
-
         row = 0
-        ttk.Label(left, text=f"1. Customer order form -- PDF or photo/scan{drop_hint}", font=("", 12, "bold")).grid(
-            row=row, column=0, columnspan=3, sticky="w", pady=(0, 4)
+        files_frame = ttk.Frame(left)
+        files_frame.grid(row=row, column=0, columnspan=3, sticky="ew", pady=(0, 14))
+        files_frame.columnconfigure(0, weight=1)
+        files_frame.columnconfigure(1, weight=1)
+
+        ttk.Label(files_frame, text="Customer Drawing", font=("", 12, "bold")).grid(
+            row=0, column=0, sticky="w", padx=(0, 6)
         )
-        row += 1
-        order_form_zone = DropZone(left, self.order_form_path, self.pick_order_form,
+        order_form_zone = DropZone(files_frame, self.order_form_path, self.pick_order_form,
                                     validator=validate_order_form_path,
                                     placeholder="Drop the customer order form here (PDF or JPG/PNG scan), or click to browse")
-        order_form_zone.grid(row=row, column=0, columnspan=2, sticky="ew", ipady=4)
-        ttk.Button(left, text="Browse…", command=self.pick_order_form).grid(row=row, column=2, padx=6, sticky="n")
-        row += 1
-
-        ttk.Label(left, text=f"2. KBRS production order PDF{drop_hint}", font=("", 12, "bold")).grid(
-            row=row, column=0, columnspan=3, sticky="w", pady=(14, 4)
+        order_form_zone.grid(row=1, column=0, sticky="new", padx=(0, 6), ipady=4)
+        ttk.Button(files_frame, text="Browse…", command=self.pick_order_form).grid(
+            row=2, column=0, sticky="w", padx=(0, 6), pady=(4, 0)
         )
-        row += 1
-        production_order_zone = DropZone(left, self.production_order_path, self.pick_production_order,
+
+        ttk.Label(files_frame, text="Customer Purchase Order", font=("", 12, "bold")).grid(
+            row=0, column=1, sticky="w", padx=(6, 0)
+        )
+        production_order_zone = DropZone(files_frame, self.production_order_path, self.pick_production_order,
                                           validator=validate_production_order_path,
                                           placeholder="Drop the KBRS production order PDF here, or click to browse")
-        production_order_zone.grid(row=row, column=0, columnspan=2, sticky="ew", ipady=4)
-        ttk.Button(left, text="Browse…", command=self.pick_production_order).grid(row=row, column=2, padx=6, sticky="n")
+        production_order_zone.grid(row=1, column=1, sticky="new", padx=(6, 0), ipady=4)
+        ttk.Button(files_frame, text="Browse…", command=self.pick_production_order).grid(
+            row=2, column=1, sticky="w", padx=(6, 0), pady=(4, 0)
+        )
         row += 1
 
         ttk.Button(left, text="Preview → read dimensions from files", command=self.preview).grid(
@@ -790,6 +1357,36 @@ class SingleOrderTab(ttk.Frame):
         row += 1
         preview_label = ttk.Label(left, textvariable=self.preview_text, foreground="#555", wraplength=520, justify="left")
         preview_label.grid(row=row, column=0, columnspan=3, sticky="w", pady=(0, 10))
+        row += 1
+
+        ttk.Label(left, text="Raw width/height override", font=("", 11, "bold")).grid(
+            row=row, column=0, columnspan=3, sticky="w", pady=(0, 4)
+        )
+        row += 1
+        raw_dim_frame = ttk.Frame(left)
+        raw_dim_frame.grid(row=row, column=0, sticky="w")
+        ttk.Label(raw_dim_frame, text="Width:").pack(side="left")
+        ttk.Entry(raw_dim_frame, textvariable=self.raw_width, width=8).pack(side="left", padx=(4, 12))
+        ttk.Label(raw_dim_frame, text="Height:").pack(side="left")
+        ttk.Entry(raw_dim_frame, textvariable=self.raw_height, width=8).pack(side="left", padx=(4, 0))
+        ttk.Label(left, text='Auto-filled when Preview reads the production order OK. Only type here if that file '
+                             "can't be read, or reads a handwritten/nonstandard order wrong — e.g. 78 or 78 1/4.",
+                  foreground="#777", wraplength=380, justify="left").grid(
+            row=row, column=1, columnspan=2, sticky="w"
+        )
+        row += 1
+
+        ttk.Label(left, text="Product type override", font=("", 11, "bold")).grid(
+            row=row, column=0, columnspan=3, sticky="w", pady=(6, 4)
+        )
+        row += 1
+        ttk.Combobox(
+            left, textvariable=self.product_type_override, values=[""] + sorted(engine.PROFILES.keys()), width=13
+        ).grid(row=row, column=0, sticky="w")
+        ttk.Label(left, text="Leave blank to auto-detect from the production order PDF. Only needed if that file "
+                             "can't be read at all.", foreground="#777", wraplength=380, justify="left").grid(
+            row=row, column=1, columnspan=2, sticky="w"
+        )
         row += 1
 
         ttk.Label(left, text="3. Traveler", font=("", 12, "bold")).grid(row=row, column=0, sticky="w", pady=(6, 4))
@@ -826,14 +1423,34 @@ class SingleOrderTab(ttk.Frame):
             row=row, column=1, columnspan=2, sticky="w"
         )
         row += 1
+        # Not every product has a calibrated spot for a thickness callout
+        # (currently CSS/CTB don't) -- typing one there used to just get
+        # silently skipped on export with no live sign anything was wrong,
+        # which read as a random "sometimes it doesn't post" glitch. This
+        # shows up immediately, right where you're typing, instead of only
+        # after Preview or Generate.
+        ttk.Label(left, textvariable=self.thickness_warning, foreground="#b00020",
+                  wraplength=520, justify="left").grid(
+            row=row, column=0, columnspan=3, sticky="w", pady=(0, 4)
+        )
+        row += 1
 
         ttk.Label(left, text="6. Curb depth (only used for Tile-Basin products)", font=("", 12, "bold")).grid(
             row=row, column=0, columnspan=3, sticky="w", pady=(10, 4)
         )
         row += 1
         ttk.Entry(left, textvariable=self.curb_depth, width=15).grid(row=row, column=0, sticky="w")
-        ttk.Label(left, text='Default 4" (HardCurb) — change if a different curb applies', foreground="#777").grid(
+        ttk.Label(left, text='Blank = curbless (0"). Type a depth if this order has a curb, e.g. 4 for standard HardCurb.',
+                  foreground="#777", wraplength=380, justify="left").grid(
             row=row, column=1, columnspan=2, sticky="w"
+        )
+        row += 1
+        ttk.Checkbutton(
+            left, text="Curb also affects width",
+            variable=self.curb_affects_width,
+        ).grid(row=row, column=0, sticky="w", pady=(2, 0))
+        ttk.Label(left, text="Double curb — e.g. an L-shaped/corner basin", foreground="#777").grid(
+            row=row, column=1, columnspan=2, sticky="w", pady=(2, 0)
         )
         row += 1
 
@@ -848,14 +1465,23 @@ class SingleOrderTab(ttk.Frame):
 
         ttk.Label(left, text="Save finished PDF to:", font=("", 12, "bold")).grid(row=row, column=0, sticky="w", pady=(14, 4))
         row += 1
-        out_dir_entry = ttk.Entry(left, textvariable=self.out_dir, width=55)
-        out_dir_entry.grid(row=row, column=0, columnspan=2, sticky="ew")
-        ttk.Button(left, text="Browse…", command=self.pick_out_dir).grid(row=row, column=2, padx=6)
+        # a Frame managing its own pack layout so "Set as default" can't get
+        # pushed into an unweighted grid column and become unreachable, the
+        # way the Browse button once did.
+        out_dir_frame = ttk.Frame(left)
+        out_dir_frame.grid(row=row, column=0, columnspan=2, sticky="ew")
+        out_dir_entry = ttk.Entry(out_dir_frame, textvariable=self.out_dir, width=32)
+        out_dir_entry.pack(side="left")
+        ttk.Button(out_dir_frame, text="Browse…", command=self.pick_out_dir).pack(side="left", padx=6)
+        ttk.Button(out_dir_frame, text="Set as default", command=self.set_default_out_dir).pack(side="left")
         make_drop_target(out_dir_entry, lambda p: self.out_dir.set(p if os.path.isdir(p) else str(Path(p).parent)))
         row += 1
 
-        gen_btn = ttk.Button(left, text="Generate", command=self.generate)
-        gen_btn.grid(row=row, column=0, sticky="w", pady=16)
+        gen_frame = ttk.Frame(left)
+        gen_frame.grid(row=row, column=0, columnspan=2, sticky="w", pady=16)
+        gen_btn = ttk.Button(gen_frame, text="Generate", command=self.generate)
+        gen_btn.pack(side="left")
+        ttk.Button(gen_frame, text="Start new order", command=self.start_new_order).pack(side="left", padx=(8, 0))
 
         row += 1
         self.status = ttk.Label(left, text="", foreground="#0a7d2c", wraplength=520, justify="left")
@@ -863,6 +1489,8 @@ class SingleOrderTab(ttk.Frame):
 
         for c in range(2):
             left.columnconfigure(c, weight=1)
+
+        _bind_scroll_recursive(left_canvas)  # covers left_canvas + every field widget inside left
 
         # -- live preview / editor panel -------------------------------------
         ttk.Label(right, text="Live preview & editor", font=("", 12, "bold")).pack(anchor="w")
@@ -879,7 +1507,8 @@ class SingleOrderTab(ttk.Frame):
 
         # auto-refresh the live preview whenever any relevant field changes
         for var in (self.order_form_path, self.production_order_path, self.material,
-                    self.thickness, self.drain_a, self.curb_depth):
+                    self.thickness, self.drain_a, self.curb_depth, self.curb_affects_width,
+                    self.raw_width, self.raw_height, self.product_type_override):
             var.trace_add("write", lambda *_: self._schedule_preview_update())
         self._schedule_preview_update()
 
@@ -930,11 +1559,24 @@ class SingleOrderTab(ttk.Frame):
         if current != calc_text:
             self.thickness.set(calc_text)
 
+    def _maybe_autofill_blue_traveler_thickness(self):
+        """Blue Traveler orders are standardly 1.5" thick -- auto-fill
+        Thickness when that material is selected/typed, same override-
+        respecting pattern (and the same _last_auto_thickness tracker, since
+        the two are mutually exclusive by material) as the CLSS/CLTB drain-A
+        formula in _maybe_autocalc_thickness above."""
+        current = self.thickness.get().strip()
+        if current and current != self._last_auto_thickness:
+            return  # user has manually overridden the auto-filled value -- respect it
+        self._last_auto_thickness = engine.BLUE_TRAVELER_THICKNESS_IN
+        if current != engine.BLUE_TRAVELER_THICKNESS_IN:
+            self.thickness.set(engine.BLUE_TRAVELER_THICKNESS_IN)
+
     def _maybe_autofill_outname(self, meta):
         """Suggest a default file name (PO-SO.pdf) once the production
         order is read, but never overwrite a name you've typed/pasted in
         by hand -- same override-respecting pattern as thickness above."""
-        if not meta:
+        if not meta or not meta["po_number"] or not meta["so_number"]:
             return
         default_name = f"{meta['po_number']}-{meta['so_number']}"
         current = self.out_name.get().strip()
@@ -954,28 +1596,41 @@ class SingleOrderTab(ttk.Frame):
         meta = profile = oversize_w = oversize_h = wide_origin = None
         if (order_form and production_order and os.path.isfile(production_order)
                 and not same_file(order_form, production_order)):
-            try:
-                meta = engine.parse_production_order(production_order)
-                profile = engine.PROFILES.get(meta["sku_prefix"])
-                if profile:
-                    try:
-                        curb = float(self.curb_depth.get() or engine.DEFAULT_CURB_DEPTH_IN)
-                    except ValueError:
-                        curb = engine.DEFAULT_CURB_DEPTH_IN
-                    oversize_w = meta["raw_width_in"] + 1
-                    oversize_h = (meta["raw_height_in"] - curb + 1) if profile.get("curb_affects_height") \
-                        else meta["raw_height_in"] + 1
-                    wide_origin = "bracket_wide" in profile and meta["raw_width_in"] > engine.WIDE_PANEL_THRESHOLD_IN
-            except Exception:
-                pass  # production order not parseable yet -- still show the plain background below
+            meta, profile, _error = self._resolve_production_meta()
+            # _error is ignored here -- an unreadable/unresolved production
+            # order just means we can't load the editor yet (still show the
+            # plain background below); preview()/_validate_and_prepare()
+            # are what actually surface the error text to the user.
+            if profile:
+                try:
+                    curb = float(self.curb_depth.get().strip() or "0")
+                except ValueError:
+                    curb = engine.DEFAULT_CURB_DEPTH_IN
+                oversize_w = (meta["raw_width_in"] - curb + 1) \
+                    if (profile.get("curb_affects_height") and self.curb_affects_width.get()) \
+                    else meta["raw_width_in"] + 1
+                oversize_h = (meta["raw_height_in"] - curb + 1) if profile.get("curb_affects_height") \
+                    else meta["raw_height_in"] + 1
+                wide_origin = "bracket_wide" in profile and meta["raw_width_in"] > engine.WIDE_PANEL_THRESHOLD_IN
 
         if order_form and os.path.isfile(order_form):
             self._maybe_autoread_drain_a(order_form)
-        self._maybe_autocalc_thickness(meta)
+        if engine.is_blue_traveler(self.material.get()):
+            self._maybe_autofill_blue_traveler_thickness()
+        else:
+            self._maybe_autocalc_thickness(meta)
         self._maybe_autofill_outname(meta)
         # an auto-fill above triggers its own StringVar write -> another
         # debounced call shortly; this pass continues with whatever was
         # already in the fields so the visuals aren't left stale meanwhile
+
+        if profile and self.thickness.get().strip() and "thickness_text_pos" not in profile:
+            self.thickness_warning.set(
+                f"⚠ {profile['name']} has no calibrated spot for a thickness callout yet — "
+                f"this won't show up on the drawing. Use Add note instead if you need it noted."
+            )
+        else:
+            self.thickness_warning.set("")
 
         if not EDITOR_AVAILABLE:
             return
@@ -1006,7 +1661,9 @@ class SingleOrderTab(ttk.Frame):
         sig = (order_form, production_order)
         if self._loaded_signature != sig:
             ok = self.layout.load_new_order(order_form, production_order, profile, material,
-                                             oversize_w, oversize_h, thickness, bool(wide_origin))
+                                             oversize_w, oversize_h, thickness, bool(wide_origin),
+                                             restore_state=self._pending_restore_state)
+            self._pending_restore_state = None
             self._loaded_signature = sig if ok else None
         else:
             self.layout.sync(material, oversize_w, oversize_h, thickness, bool(wide_origin))
@@ -1040,46 +1697,117 @@ class SingleOrderTab(ttk.Frame):
         if p:
             self.out_dir.set(p)
 
-    def preview(self):
-        po_path = self.production_order_path.get()
-        if not po_path:
-            self.preview_text.set("Choose the production order PDF first.")
+    def set_default_out_dir(self):
+        p = self.out_dir.get().strip()
+        if not p or not os.path.isdir(p):
+            messagebox.showerror("Invalid folder", "Choose or type a valid, existing folder first.")
             return
+        engine.set_default_output_dir(p)
+        messagebox.showinfo("Default saved", f"New orders will default to saving here:\n\n{p}\n\nYou can still change it per-order.")
+
+    def _resolve_production_meta(self):
+        """Merge a production-order-PDF parse with the manual raw
+        width/height/product-type overrides. On a successful parse, also
+        auto-fills the override fields (unless the user's already typed
+        something different) so a wrong read is easy to spot and correct --
+        same override-respecting pattern as thickness/drain-A.
+
+        Returns (meta, profile, error). meta's po_number/so_number/item_name/
+        sku are None if the file itself couldn't be parsed at all (manual
+        entry only); error is a user-facing string, or None on success."""
+        po_path = self.production_order_path.get()
+        parsed = None
+        parse_error = None
+        if po_path:
+            try:
+                parsed = engine.parse_production_order(po_path)
+            except Exception as e:
+                parse_error = str(e)
+
+        if parsed:
+            for field, var, last_attr in (
+                ("raw_width_in", self.raw_width, "_last_auto_raw_width"),
+                ("raw_height_in", self.raw_height, "_last_auto_raw_height"),
+            ):
+                auto_text = engine.fmt_inches(parsed[field])
+                current = var.get().strip()
+                if (not current or current == getattr(self, last_attr)) and current != auto_text:
+                    var.set(auto_text)  # StringVar.set() fires its trace unconditionally, even
+                    # to the same value -- writing every cycle re-armed the debounce timer
+                    # forever, which meant sync() (and its destructive item redraws) kept
+                    # firing every ~400ms and interrupting any drag in progress.
+                setattr(self, last_attr, auto_text)
+
+        sku_prefix = self.product_type_override.get().strip() or (parsed["sku_prefix"] if parsed else None)
+        raw_w_text = self.raw_width.get().strip()
+        raw_h_text = self.raw_height.get().strip()
         try:
-            meta = engine.parse_production_order(po_path)
-            profile = engine.PROFILES.get(meta["sku_prefix"])
-            lines = [
-                f"PO {meta['po_number']}  /  SO {meta['so_number']}",
-                f"Item: {meta['item_name']} ({meta['sku']})",
-                f"Raw size: {meta['raw_width_in']}\" x {meta['raw_height_in']}\"",
-            ]
-            if profile:
-                lines[0] = f"{profile['name']}  —  " + lines[0]
-                try:
-                    curb = float(self.curb_depth.get() or engine.DEFAULT_CURB_DEPTH_IN)
-                except ValueError:
-                    curb = engine.DEFAULT_CURB_DEPTH_IN
-                oversize_w = meta["raw_width_in"] + 1
-                if profile.get("curb_affects_height"):
-                    oversize_h = meta["raw_height_in"] - curb + 1
-                    lines.append(f"Oversize: {oversize_w}\" x {oversize_h}\"  (height uses curb depth {curb}\")")
-                else:
-                    oversize_h = meta["raw_height_in"] + 1
-                    lines.append(f"Oversize: {oversize_w}\" x {oversize_h}\"")
-                thickness_val = self.thickness.get().strip()
-                if "thickness_text_pos" in profile:
-                    lines.append(f"Thickness: {'will show “' + thickness_val + '”' if thickness_val else 'blank — nothing shown'}")
-                elif thickness_val:
-                    lines.append(f"⚠ You entered a thickness, but {profile['name']} has no calibrated spot for it yet — it will be skipped.")
-                else:
-                    lines.append("No thickness callout for this product yet (none entered, none needed).")
-                if "bracket_wide" in profile and meta["raw_width_in"] > engine.WIDE_PANEL_THRESHOLD_IN:
-                    lines.append(f"⚠ WIDE PANEL (>{engine.WIDE_PANEL_THRESHOLD_IN}\") — origin bracket will move to bottom-left. Verify on output.")
+            raw_width_in = engine.inches_to_decimal(raw_w_text) if raw_w_text else (parsed["raw_width_in"] if parsed else None)
+            raw_height_in = engine.inches_to_decimal(raw_h_text) if raw_h_text else (parsed["raw_height_in"] if parsed else None)
+        except ValueError:
+            return None, None, 'Raw width/height must be a number or fraction, e.g. 78 or "78 1/4".'
+
+        if raw_width_in is None or raw_height_in is None or sku_prefix is None:
+            if parse_error is not None:
+                return None, None, f"Could not read the production order file: {parse_error}"
+            return None, None, "Fill in the Raw width/height and Product type overrides below, or choose a readable production order PDF."
+
+        meta = {
+            "po_number": parsed["po_number"] if parsed else None,
+            "so_number": parsed["so_number"] if parsed else None,
+            "sku": parsed["sku"] if parsed else sku_prefix,
+            "sku_prefix": sku_prefix,
+            "item_name": parsed["item_name"] if parsed else "",
+            "raw_width_in": raw_width_in,
+            "raw_height_in": raw_height_in,
+        }
+        return meta, engine.PROFILES.get(sku_prefix), None
+
+    def preview(self):
+        if not self.production_order_path.get() and not (
+            self.raw_width.get().strip() and self.raw_height.get().strip() and self.product_type_override.get().strip()
+        ):
+            self.preview_text.set("Choose the production order PDF first (or fill in the manual overrides below).")
+            return
+        meta, profile, error = self._resolve_production_meta()
+        if error:
+            self.preview_text.set(f"⚠ {error}")
+            return
+        lines = []
+        if meta["po_number"]:
+            lines.append(f"PO {meta['po_number']}  /  SO {meta['so_number']}")
+        if meta["item_name"]:
+            lines.append(f"Item: {meta['item_name']} ({meta['sku']})")
+        if not lines:
+            lines.append("(manual entry — production order file couldn't be read)")
+        lines.append(f"Raw size: {meta['raw_width_in']}\" x {meta['raw_height_in']}\"")
+        if profile:
+            lines[0] = f"{profile['name']}  —  " + lines[0]
+            try:
+                curb = float(self.curb_depth.get().strip() or "0")
+            except ValueError:
+                curb = engine.DEFAULT_CURB_DEPTH_IN
+            double_curb = profile.get("curb_affects_height") and self.curb_affects_width.get()
+            oversize_w = (meta["raw_width_in"] - curb + 1) if double_curb else meta["raw_width_in"] + 1
+            if profile.get("curb_affects_height"):
+                oversize_h = meta["raw_height_in"] - curb + 1
+                curb_note = "width and height use" if double_curb else "height uses"
+                lines.append(f"Oversize: {oversize_w}\" x {oversize_h}\"  ({curb_note} curb depth {curb}\")")
             else:
-                lines.append(f"⚠ No annotation layout yet for SKU prefix '{meta['sku_prefix']}'. Send a sample form for this product line.")
-            self.preview_text.set("\n".join(lines))
-        except Exception as e:
-            self.preview_text.set(f"Could not read that file: {e}")
+                oversize_h = meta["raw_height_in"] + 1
+                lines.append(f"Oversize: {oversize_w}\" x {oversize_h}\"")
+            thickness_val = self.thickness.get().strip()
+            if "thickness_text_pos" in profile:
+                lines.append(f"Thickness: {'will show “' + thickness_val + '”' if thickness_val else 'blank — nothing shown'}")
+            elif thickness_val:
+                lines.append(f"⚠ You entered a thickness, but {profile['name']} has no calibrated spot for it yet — it will be skipped.")
+            else:
+                lines.append("No thickness callout for this product yet (none entered, none needed).")
+            if "bracket_wide" in profile and meta["raw_width_in"] > engine.WIDE_PANEL_THRESHOLD_IN:
+                lines.append(f"⚠ WIDE PANEL (>{engine.WIDE_PANEL_THRESHOLD_IN}\") — origin bracket will move to bottom-left. Verify on output.")
+        else:
+            lines.append(f"⚠ No annotation layout yet for SKU prefix '{meta['sku_prefix']}'. Send a sample form for this product line.")
+        self.preview_text.set("\n".join(lines))
 
     def _validate_and_prepare(self):
         """Shared setup for Generate and Edit-before-generating. Returns a
@@ -1090,7 +1818,7 @@ class SingleOrderTab(ttk.Frame):
         thickness = self.thickness.get().strip() or None
         out_dir = self.out_dir.get().strip()
         try:
-            curb_depth = float(self.curb_depth.get() or engine.DEFAULT_CURB_DEPTH_IN)
+            curb_depth = float(self.curb_depth.get().strip() or "0")
         except ValueError:
             messagebox.showerror("Invalid curb depth", "Curb depth must be a number, e.g. 4")
             return None
@@ -1115,12 +1843,10 @@ class SingleOrderTab(ttk.Frame):
             messagebox.showerror("Missing output folder", "Choose where to save the finished PDF.")
             return None
 
-        try:
-            meta = engine.parse_production_order(production_order)
-        except Exception as e:
-            messagebox.showerror("Couldn't read production order", str(e))
+        meta, profile, error = self._resolve_production_meta()
+        if error:
+            messagebox.showerror("Couldn't read production order", error)
             return None
-        profile = engine.PROFILES.get(meta["sku_prefix"])
         if not profile:
             messagebox.showerror(
                 "Unknown product",
@@ -1128,7 +1854,9 @@ class SingleOrderTab(ttk.Frame):
             )
             return None
 
-        oversize_w = meta["raw_width_in"] + 1
+        oversize_w = (meta["raw_width_in"] - curb_depth + 1) \
+            if (profile.get("curb_affects_height") and self.curb_affects_width.get()) \
+            else meta["raw_width_in"] + 1
         if profile.get("curb_affects_height"):
             oversize_h = meta["raw_height_in"] - curb_depth + 1
         else:
@@ -1138,8 +1866,10 @@ class SingleOrderTab(ttk.Frame):
         typed_name = self.out_name.get().strip()
         if typed_name:
             out_name = typed_name if typed_name.lower().endswith(".pdf") else typed_name + ".pdf"
-        else:
+        elif meta["po_number"] and meta["so_number"]:
             out_name = f"{meta['po_number']}-{meta['so_number']}.pdf"
+        else:
+            out_name = Path(order_form).stem + "-markup.pdf"
         out_path = str(Path(out_dir) / out_name)
 
         return {
@@ -1148,6 +1878,98 @@ class SingleOrderTab(ttk.Frame):
             "meta": meta, "profile": profile, "oversize_w": oversize_w, "oversize_h": oversize_h,
             "wide_origin": wide_origin, "out_path": out_path,
         }
+
+    def open_recent_order(self, entry):
+        """Reopen a previously generated order (File > Recent Orders) with
+        its full markup restored -- dragged item positions, brackets, notes,
+        cut line, background rotate/resize -- so a single quick change (e.g.
+        a corrected dimension) doesn't require re-marking the whole drawing
+        up from scratch."""
+        order_form = entry.get("order_form_path", "")
+        production_order = entry.get("production_order_path", "")
+        if not order_form or not os.path.isfile(order_form):
+            messagebox.showerror(
+                "File missing",
+                f"Can't find the order form for this recent order:\n\n{order_form}\n\n"
+                "It may have been moved, renamed, or deleted."
+            )
+            return
+        if not production_order or not os.path.isfile(production_order):
+            messagebox.showerror(
+                "File missing",
+                f"Can't find the production order for this recent order:\n\n{production_order}\n\n"
+                "It may have been moved, renamed, or deleted."
+            )
+            return
+
+        if self._preview_after_id is not None:
+            self.after_cancel(self._preview_after_id)
+            self._preview_after_id = None
+
+        layout_state = entry.get("layout") or {}
+        brackets = [
+            {"offset": tuple(b.get("offset", (0.0, 0.0))), "rotation": b.get("rotation", 0)}
+            for b in layout_state.get("brackets") or [{"offset": (0.0, 0.0), "rotation": 0}]
+        ]
+        self._pending_restore_state = {
+            "items": layout_state.get("items", []),
+            "brackets": brackets,
+            "bar_offset": tuple(layout_state.get("bar_offset", (0.0, 0.0))),
+            "has_cut_line": layout_state.get("has_cut_line", False),
+            "bg_rotation": layout_state.get("bg_rotation", 0),
+            "bg_scale": layout_state.get("bg_scale", 1.0),
+        }
+        # force a full reload through load_new_order() (rather than the
+        # lighter sync() path) even if these happen to be the same two files
+        # already showing, so restore_state is actually applied
+        self._loaded_signature = None
+
+        self.material.set(entry.get("material", ""))
+        self.thickness.set(entry.get("thickness", ""))
+        self.drain_a.set(entry.get("drain_a", ""))
+        self.curb_depth.set(entry.get("curb_depth", ""))
+        self.curb_affects_width.set(entry.get("curb_affects_width", False))
+        self.raw_width.set(entry.get("raw_width", ""))
+        self.raw_height.set(entry.get("raw_height", ""))
+        self.product_type_override.set(entry.get("product_type_override", ""))
+        self.out_name.set(entry.get("out_name", ""))
+        if entry.get("out_dir"):
+            self.out_dir.set(entry["out_dir"])
+        self.order_form_path.set(order_form)
+        self.production_order_path.set(production_order)
+        self.status.config(
+            text=f"Reopened {entry.get('label', '')} — markup restored. Make your change and click Generate to update it.",
+            foreground="#0a7d2c",
+        )
+
+    def start_new_order(self):
+        """Clear everything specific to the order just finished so the next
+        one can be started fresh, without relaunching the app. The default
+        output folder (out_dir) is intentionally left alone -- that's a
+        persistent per-computer setting, not per-order data."""
+        if self._preview_after_id is not None:
+            self.after_cancel(self._preview_after_id)
+            self._preview_after_id = None
+        self.order_form_path.set("")
+        self.production_order_path.set("")
+        self.material.set("")
+        self.thickness.set("")
+        self.drain_a.set("")
+        self.raw_width.set("")
+        self.raw_height.set("")
+        self.product_type_override.set("")
+        self.curb_depth.set("")
+        self.curb_affects_width.set(False)
+        self.out_name.set("")
+        self._last_auto_thickness = None
+        self._autoread_attempted_for = None
+        self._last_auto_outname = None
+        self._last_auto_raw_width = None
+        self._last_auto_raw_height = None
+        self._loaded_signature = None
+        self.preview_text.set("Choose both files, then click Preview.")
+        self.status.config(text="", foreground="#0a7d2c")
+        self.layout.show_placeholder("Load an order form to see it here")
 
     def generate(self):
         # force the live layout to reflect the very latest field values
@@ -1168,29 +1990,67 @@ class SingleOrderTab(ttk.Frame):
         # use whatever's currently in the live layout (including any drags,
         # edits, notes, or a cut-for-shipping line) if it matches this exact
         # order; otherwise fall back to fresh default positions
-        if self.layout.matches(ctx["order_form"], ctx["production_order"]):
+        matches = self.layout.matches(ctx["order_form"], ctx["production_order"])
+        order_form_for_merge = ctx["order_form"]
+        if matches:
             items = self.layout.get_items()
             oversize_w = self.layout.oversize_w  # includes the cut-for-shipping bump, if present
             wide_origin = self.layout.wide_origin
-            bracket_offset = self.layout.get_bracket_offset()  # manual nudge from the live preview, if any
-            bracket_rotation = self.layout.get_bracket_rotation()  # manual rotation, if any
+            brackets = self.layout.get_brackets()  # manual nudge(s)/rotation(s) from the live preview, if any
+            bar_offset = self.layout.get_bar_offset()  # manual nudge for the Traveler bar, if any
+            if self.layout.bg_rotation or abs(self.layout.bg_scale - 1.0) > 0.001:
+                order_form_for_merge = engine.get_transformed_order_form(
+                    ctx["order_form"], self.layout.bg_rotation, self.layout.bg_scale)
         else:
             items = engine.compute_default_items(ctx["profile"], ctx["oversize_w"], ctx["oversize_h"],
                                                    thickness=ctx["thickness"])
             oversize_w = ctx["oversize_w"]
             wide_origin = ctx["wide_origin"]
-            bracket_offset = (0.0, 0.0)
-            bracket_rotation = 0
-
+            brackets = [{"offset": (0.0, 0.0), "rotation": 0}]
+            bar_offset = (0.0, 0.0)
         try:
             overlay_bytes = engine.render_page(ctx["profile"], ctx["material"], items, wide_origin=wide_origin,
-                                                bracket_offset=bracket_offset, bracket_rotation=bracket_rotation)
-            engine.merge_pdf(ctx["order_form"], ctx["production_order"], overlay_bytes, ctx["out_path"])
+                                                brackets=brackets, bar_offset=bar_offset)
+            engine.merge_pdf(order_form_for_merge, ctx["production_order"], overlay_bytes, ctx["out_path"])
         except Exception as e:
             traceback.print_exc()
             messagebox.showerror("Failed", str(e))
             self.status.config(text="Failed — see message.", foreground="#b00020")
             return
+
+        # remember this order (inputs + the exact markup just exported) so
+        # it can be reopened later from File > Recent Orders for a quick
+        # single-field change without re-marking the whole drawing up again
+        try:
+            recent_entry = {
+                "label": Path(ctx["out_path"]).stem,
+                "timestamp": datetime.now().isoformat(timespec="seconds"),
+                "order_form_path": ctx["order_form"],
+                "production_order_path": ctx["production_order"],
+                "material": ctx["material"],
+                "thickness": ctx["thickness"],
+                "drain_a": self.drain_a.get().strip(),
+                "curb_depth": self.curb_depth.get().strip(),
+                "curb_affects_width": self.curb_affects_width.get(),
+                "raw_width": self.raw_width.get().strip(),
+                "raw_height": self.raw_height.get().strip(),
+                "product_type_override": self.product_type_override.get().strip(),
+                "out_name": Path(ctx["out_path"]).name,
+                "out_dir": str(Path(ctx["out_path"]).parent),
+                "layout": {
+                    "items": items,
+                    "brackets": brackets,
+                    "bar_offset": list(bar_offset),
+                    "has_cut_line": self.layout.has_cut_line if matches else False,
+                    "bg_rotation": self.layout.bg_rotation if matches else 0,
+                    "bg_scale": self.layout.bg_scale if matches else 1.0,
+                },
+            }
+            engine.save_recent_order(recent_entry)
+            if self.on_recent_orders_changed:
+                self.on_recent_orders_changed()
+        except Exception:
+            traceback.print_exc()  # non-critical -- never block a successful export over this
 
         # verify what actually landed on disk -- if page 2 or its rotation
         # is somehow missing, say so loudly instead of a silent "Done"
@@ -1212,194 +2072,111 @@ class SingleOrderTab(ttk.Frame):
         status_color = "#b00020" if page_note else "#0a7d2c"
         self.status.config(text=f"Done → {ctx['out_path']} (2 pages, page 2 rotated){wide_msg}{thick_msg}{page_note}",
                             foreground=status_color)
-        open_in_finder(ctx["out_path"])
-
-
-class BatchTab(ttk.Frame):
-    def __init__(self, master):
-        super().__init__(master, padding=16)
-        self.folder = tk.StringVar()
-        self.manifest = tk.StringVar()
-        self.out_dir = tk.StringVar(value=str(Path.home() / "Desktop" / "KBRS Markup Output"))
-
-        drop_hint = " (or drag & drop it here)" if DND_AVAILABLE else ""
-
-        row = 0
-        ttk.Label(self, text=f"Folder of paired PDFs{drop_hint}", font=("", 12, "bold")).grid(row=row, column=0, columnspan=3, sticky="w")
-        row += 1
-        ttk.Label(
-            self,
-            text="Each order = 2 files whose names both contain the PO number, e.g. PO247946_orderform.pdf and PO247946_production.pdf",
-            foreground="#555", wraplength=520, justify="left",
-        ).grid(row=row, column=0, columnspan=3, sticky="w", pady=(0, 6))
-        row += 1
-        folder_entry = ttk.Entry(self, textvariable=self.folder, width=55)
-        folder_entry.grid(row=row, column=0, columnspan=2, sticky="ew")
-        ttk.Button(self, text="Browse…", command=self.pick_folder).grid(row=row, column=2, padx=6)
-        make_drop_target(folder_entry, lambda p: self.folder.set(p if os.path.isdir(p) else str(Path(p).parent)))
-        row += 1
-
-        ttk.Label(self, text=f"Manifest CSV (material + thickness/curb per PO){drop_hint}", font=("", 12, "bold")).grid(
-            row=row, column=0, columnspan=3, sticky="w", pady=(14, 4)
-        )
-        row += 1
-        manifest_entry = ttk.Entry(self, textvariable=self.manifest, width=55)
-        manifest_entry.grid(row=row, column=0, columnspan=2, sticky="ew")
-        ttk.Button(self, text="Browse…", command=self.pick_manifest).grid(row=row, column=2, padx=6)
-        make_drop_target(manifest_entry, self.manifest.set)
-        row += 1
-        ttk.Button(self, text="Create manifest template from folder…", command=self.make_manifest_template).grid(
-            row=row, column=0, sticky="w", pady=(4, 10)
-        )
-        row += 1
-
-        ttk.Label(self, text=f"Output folder{drop_hint}", font=("", 12, "bold")).grid(row=row, column=0, sticky="w", pady=(10, 4))
-        row += 1
-        batch_out_entry = ttk.Entry(self, textvariable=self.out_dir, width=55)
-        batch_out_entry.grid(row=row, column=0, columnspan=2, sticky="ew")
-        ttk.Button(self, text="Browse…", command=self.pick_out_dir).grid(row=row, column=2, padx=6)
-        make_drop_target(batch_out_entry, lambda p: self.out_dir.set(p if os.path.isdir(p) else str(Path(p).parent)))
-        row += 1
-
-        ttk.Button(self, text="Run batch", command=self.run_batch).grid(row=row, column=0, sticky="w", pady=16)
-        row += 1
-
-        self.log = tk.Text(self, height=14, width=72, state="disabled")
-        self.log.grid(row=row, column=0, columnspan=3, sticky="nsew")
-        self.rowconfigure(row, weight=1)
-        for c in range(2):
-            self.columnconfigure(c, weight=1)
-
-    def pick_folder(self):
-        p = filedialog.askdirectory(title="Choose folder with order form + production order PDFs")
-        if p:
-            self.folder.set(p)
-
-    def pick_manifest(self):
-        p = filedialog.askopenfilename(title="Choose manifest.csv", filetypes=[("CSV", "*.csv")])
-        if p:
-            self.manifest.set(p)
-
-    def pick_out_dir(self):
-        p = filedialog.askdirectory(title="Choose output folder")
-        if p:
-            self.out_dir.set(p)
-
-    def _log(self, msg):
-        self.log.config(state="normal")
-        self.log.insert("end", msg + "\n")
-        self.log.see("end")
-        self.log.config(state="disabled")
-
-    def make_manifest_template(self):
-        folder = self.folder.get()
-        if not folder:
-            messagebox.showerror("Choose a folder first", "Pick the folder of PDFs before creating a manifest template.")
-            return
-        po_re = re.compile(r"(PO\d+)", re.IGNORECASE)
-        pos = set()
-        for f in Path(folder).glob("*.pdf"):
-            m = po_re.search(f.name)
-            if m:
-                pos.add(m.group(1).upper())
-        if not pos:
-            messagebox.showwarning("No PO numbers found", "Couldn't find any 'PO#####' patterns in that folder's filenames.")
-            return
-        save_path = filedialog.asksaveasfilename(
-            title="Save manifest template", defaultextension=".csv",
-            initialfile="manifest.csv", filetypes=[("CSV", "*.csv")],
-        )
-        if not save_path:
-            return
-        with open(save_path, "w", newline="") as f:
-            writer = csv.writer(f)
-            writer.writerow(["po_number", "material", "thickness", "curb_depth"])
-            for po in sorted(pos):
-                writer.writerow([po, "", "", ""])
-        self.manifest.set(save_path)
-        messagebox.showinfo(
-            "Template created",
-            f"Created {save_path} with {len(pos)} PO number(s).\n\n"
-            "Fill in 'material' for each (required). 'thickness' is optional on any product "
-            "(blank = not shown; mostly used for Linear/SRC, but you can add it to others too — "
-            "unsupported products will just skip it with a warning in the log). 'curb_depth' only "
-            "matters for Tile-Basin products (blank = 4\"). Then Run batch.",
-        )
-
-    def run_batch(self):
-        folder = self.folder.get()
-        manifest = self.manifest.get()
-        outdir = self.out_dir.get()
-        if not folder or not manifest or not outdir:
-            messagebox.showerror("Missing info", "Choose the folder, manifest.csv, and output folder.")
-            return
-
-        def worker():
-            self._log(f"Starting batch from {folder} …")
-            Path(outdir).mkdir(parents=True, exist_ok=True)
-            manifest_rows = {}
-            with open(manifest, newline="") as f:
-                for r in csv.DictReader(f):
-                    manifest_rows[r["po_number"].strip().upper()] = r
-
-            po_re = re.compile(r"(PO\d+)", re.IGNORECASE)
-            pairs = {}
-            for f in Path(folder).glob("*.pdf"):
-                m = po_re.search(f.name)
-                if not m:
-                    self._log(f"SKIP (no PO# in filename): {f.name}")
-                    continue
-                po = m.group(1).upper()
-                pairs.setdefault(po, {})
-                if "production" in f.name.lower() or "purchaseorder" in f.name.lower():
-                    pairs[po]["production"] = str(f)
-                else:
-                    pairs[po]["order_form"] = str(f)
-
-            ok, fail = 0, 0
-            for po, files in sorted(pairs.items()):
-                if "order_form" not in files or "production" not in files:
-                    self._log(f"SKIP {po}: missing order form or production order file")
-                    fail += 1
-                    continue
-                row = manifest_rows.get(po, {})
-                material = (row.get("material") or "").strip()
-                thickness = (row.get("thickness") or "").strip() or None
-                try:
-                    curb_depth = float(row["curb_depth"]) if row.get("curb_depth") else engine.DEFAULT_CURB_DEPTH_IN
-                except ValueError:
-                    curb_depth = engine.DEFAULT_CURB_DEPTH_IN
-                if not material:
-                    self._log(f"SKIP {po}: no material in manifest.csv")
-                    fail += 1
-                    continue
-                try:
-                    result = engine.build_output(
-                        files["order_form"], files["production"], material,
-                        str(Path(outdir) / f"{po}.pdf"),
-                        thickness=thickness, curb_depth_in=curb_depth,
-                    )
-                    wide_note = "  ⚠ WIDE PANEL, verify origin" if result["wide_origin"] else ""
-                    thick_note = "  ⚠ thickness not supported for this product, skipped" if result["thickness_unsupported"] else ""
-                    self._log(f"OK {po}: {result['oversize_width_in']}\" x {result['oversize_height_in']}\"{wide_note}{thick_note}")
-                    ok += 1
-                except Exception as e:
-                    self._log(f"FAIL {po}: {e}")
-                    fail += 1
-            self._log(f"\nDone. {ok} succeeded, {fail} skipped/failed. Output in: {outdir}")
-
-        threading.Thread(target=worker, daemon=True).start()
 
 
 def main():
-    root = TkinterDnD.Tk() if DND_AVAILABLE else tk.Tk()
+    global DND_AVAILABLE
+    root = None
+    if DND_AVAILABLE:
+        try:
+            root = TkinterDnD.Tk()
+        except Exception:
+            # tkinterdnd2's bundled tkdnd binary can fail to load at runtime
+            # (e.g. Tcl version mismatch when frozen by PyInstaller) even
+            # though the import itself succeeded — fall back like a missing
+            # install.
+            DND_AVAILABLE = False
+    if root is None:
+        root = tk.Tk()
     root.title("KBRS Production Markup")
-    root.geometry("1040x860")
+    root.geometry("1360x900")
+    root.minsize(1000, 600)
 
-    nb = ttk.Notebook(root)
-    nb.pack(fill="both", expand=True)
-    nb.add(SingleOrderTab(nb), text="Single order")
-    nb.add(BatchTab(nb), text="Batch")
+    ACCENT_PRESETS = [
+        ("Orange", "#f2842f"),
+        ("Blue", "#91afda"),
+        ("Green", "#84bf78"),
+        ("Pink", "#e282af"),
+    ]
+
+    def apply_accent_color(hex_code):
+        # This install's accent color (default orange) for every measurement
+        # overlay -- lets different computers running this app be set to a
+        # different color, e.g. to tell whose copy generated a sheet.
+        engine.set_accent_color(hex_code)
+        ITEM_COLOR_HEX["orange"] = hex_code
+        messagebox.showinfo(
+            "Accent color saved",
+            "Saved for this computer. It'll apply the next time you load or refresh a preview.",
+        )
+
+    def pick_accent_color():
+        dlg = tk.Toplevel(root)
+        dlg.title("Choose accent color")
+        dlg.resizable(False, False)
+        ttk.Label(dlg, text="This computer's accent color for measurement overlays:").pack(padx=14, pady=(14, 6))
+        swatches = ttk.Frame(dlg)
+        swatches.pack(padx=14)
+        for name, hex_code in ACCENT_PRESETS:
+            tk.Button(
+                swatches, text=name, bg=hex_code, fg="black", width=8, relief="raised",
+                command=lambda h=hex_code: (apply_accent_color(h), dlg.destroy()),
+            ).pack(side="left", padx=4)
+
+        def custom():
+            _rgb, hex_code = colorchooser.askcolor(color=ITEM_COLOR_HEX["orange"], title="Choose a custom accent color", parent=dlg)
+            if hex_code:
+                apply_accent_color(hex_code)
+                dlg.destroy()
+
+        ttk.Button(dlg, text="Custom color…", command=custom).pack(pady=14)
+
+    top_bar = ttk.Frame(root)
+    top_bar.pack(fill="x", padx=8, pady=(6, 0))
+    ttk.Button(top_bar, text="Accent color…", command=pick_accent_color).pack(side="right")
+
+    tab = SingleOrderTab(root)
+    tab.pack(fill="both", expand=True)
+
+    # File > Recent Orders -- reopen any of the last MAX_RECENT_ORDERS
+    # generated orders with its full markup restored, for a quick edit.
+    menubar = tk.Menu(root)
+    root.config(menu=menubar)
+    file_menu = tk.Menu(menubar, tearoff=0)
+    menubar.add_cascade(label="File", menu=file_menu)
+    recent_menu = tk.Menu(file_menu, tearoff=0)
+    file_menu.add_cascade(label="Recent Orders", menu=recent_menu)
+
+    def refresh_recent_menu():
+        recent_menu.delete(0, "end")
+        entries = engine.get_recent_orders()
+        if not entries:
+            recent_menu.add_command(label="(no recent orders yet)", state="disabled")
+            return
+        for entry in entries:
+            label = entry.get("label") or "(untitled)"
+            ts_display = ""
+            try:
+                # %-d/%-I (no leading zero) are Linux/macOS-only strftime
+                # extensions and would raise on Windows -- %d/%I plus a
+                # manual lstrip keeps this portable for the Windows build.
+                dt = datetime.fromisoformat(entry["timestamp"])
+                ts_display = "  —  " + dt.strftime("%b ") + dt.strftime("%d").lstrip("0") \
+                    + dt.strftime(", %I:%M %p").replace(", 0", ", ")
+            except (KeyError, ValueError):
+                pass
+            recent_menu.add_command(label=f"{label}{ts_display}", command=lambda e=entry: tab.open_recent_order(e))
+        recent_menu.add_separator()
+
+        def clear():
+            if messagebox.askyesno("Clear recent orders", "Remove all entries from the recent-orders list?"):
+                engine.clear_recent_orders()
+                refresh_recent_menu()
+
+        recent_menu.add_command(label="Clear recent orders", command=clear)
+
+    tab.on_recent_orders_changed = refresh_recent_menu
+    refresh_recent_menu()
 
     if not DND_AVAILABLE:
         ttk.Label(

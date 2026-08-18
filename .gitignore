@@ -6,3 +6,9 @@ Thumbs.db
 * copy.md
 *.pdf
 !kbrs_markup_demo_PO247946.pdf
+
+# PyInstaller build output (Mac .app and Windows .exe) -- rebuilt locally or
+# by the build-windows.yml GitHub Actions workflow, never committed
+build/
+dist/
+*.zip

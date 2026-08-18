@@ -40,4 +40,9 @@ if ! python3 -c "import pypdfium2" &> /dev/null; then
     python3 -m pip install --user --quiet pypdfium2
 fi
 
+if ! python3 -c "import pikepdf" &> /dev/null; then
+    echo "Installing free fillable-PDF flattening support (pikepdf)..."
+    python3 -m pip install --user --quiet pikepdf
+fi
+
 python3 app.py

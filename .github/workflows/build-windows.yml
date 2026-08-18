@@ -1,0 +1,59 @@
+name: Build Windows app
+
+# Builds a Windows .exe on every push to main (PyInstaller can't
+# cross-compile from macOS, so this has to run on an actual Windows
+# machine -- GitHub's windows-latest runner). Publishes it to a single
+# rolling release ("windows-latest-build") so both Windows computers can
+# bookmark one stable download link and just re-download it after any
+# update, instead of hunting for a new URL each time.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "app.py"
+      - "kbrs_markup.py"
+      - "kbrs_markup_windows.spec"
+      - ".github/workflows/build-windows.yml"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install reportlab pypdf Pillow tkinterdnd2 pypdfium2 pikepdf pyinstaller
+
+      - name: Build with PyInstaller
+        run: pyinstaller kbrs_markup_windows.spec --noconfirm
+
+      - name: Zip the build
+        run: Compress-Archive -Path "dist/KBRS Markup" -DestinationPath "KBRS-Markup-Windows.zip"
+
+      - name: Publish rolling release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: windows-latest-build
+          name: KBRS Markup (Windows) — latest
+          body: |
+            Automatically rebuilt from the latest push to main.
+
+            **To install:** download `KBRS-Markup-Windows.zip`, unzip it anywhere,
+            then double-click `KBRS Markup.exe` inside the unzipped folder.
+            Keep the whole folder together -- the .exe needs the files next to it.
+
+            **To update:** re-download this same file later and replace the old
+            unzipped folder with the new one.
+          files: KBRS-Markup-Windows.zip
+          make_latest: true

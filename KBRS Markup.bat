@@ -63,4 +63,10 @@ if not %ERRORLEVEL%==0 (
     %PYCMD% -m pip install --user --quiet pypdfium2
 )
 
+%PYCMD% -c "import pikepdf" >nul 2>nul
+if not %ERRORLEVEL%==0 (
+    echo Installing free fillable-PDF support...
+    %PYCMD% -m pip install --user --quiet pikepdf
+)
+
 %PYCMD% app.py
