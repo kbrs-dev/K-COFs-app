@@ -38,6 +38,14 @@ jobs:
       - name: Build with PyInstaller
         run: pyinstaller kbrs_markup_windows.spec --noconfirm
 
+      - name: Stamp this build's version
+        # A plain text file with the commit SHA, bundled next to the exe
+        # (read by app.py's get_local_version()) AND uploaded standalone as
+        # its own tiny release asset (read by get_remote_version()) -- the
+        # app can then cheaply check "am I behind?" on launch without
+        # downloading the whole 32MB zip just to find out.
+        run: Set-Content -Path "dist/KBRS Markup/version.txt" -Value "${{ github.sha }}" -NoNewline
+
       - name: Zip the build
         run: Compress-Archive -Path "dist/KBRS Markup" -DestinationPath "KBRS-Markup-Windows.zip"
 
@@ -53,7 +61,11 @@ jobs:
             then double-click `KBRS Markup.exe` inside the unzipped folder.
             Keep the whole folder together -- the .exe needs the files next to it.
 
-            **To update:** re-download this same file later and replace the old
-            unzipped folder with the new one.
-          files: KBRS-Markup-Windows.zip
+            **To update:** the app checks for updates on launch and can install
+            them itself (Check for Updates in the File menu, or the banner when
+            one's available). If you ever need to do it manually, re-download
+            this same file and replace the old unzipped folder with the new one.
+          files: |
+            KBRS-Markup-Windows.zip
+            dist/KBRS Markup/version.txt
           make_latest: true

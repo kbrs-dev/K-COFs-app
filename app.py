@@ -14,7 +14,9 @@ or double-click "KBRS Markup.command" in the same folder.
 import copy
 import io
 import os
+import platform
 import re
+import threading
 import traceback
 from datetime import datetime
 from pathlib import Path
@@ -1463,25 +1465,13 @@ class SingleOrderTab(ttk.Frame):
         )
         row += 1
 
-        ttk.Label(left, text="Save finished PDF to:", font=("", 12, "bold")).grid(row=row, column=0, sticky="w", pady=(14, 4))
-        row += 1
-        # a Frame managing its own pack layout so "Set as default" can't get
-        # pushed into an unweighted grid column and become unreachable, the
-        # way the Browse button once did.
-        out_dir_frame = ttk.Frame(left)
-        out_dir_frame.grid(row=row, column=0, columnspan=2, sticky="ew")
-        out_dir_entry = ttk.Entry(out_dir_frame, textvariable=self.out_dir, width=32)
-        out_dir_entry.pack(side="left")
-        ttk.Button(out_dir_frame, text="Browse…", command=self.pick_out_dir).pack(side="left", padx=6)
-        ttk.Button(out_dir_frame, text="Set as default", command=self.set_default_out_dir).pack(side="left")
-        make_drop_target(out_dir_entry, lambda p: self.out_dir.set(p if os.path.isdir(p) else str(Path(p).parent)))
-        row += 1
-
         gen_frame = ttk.Frame(left)
         gen_frame.grid(row=row, column=0, columnspan=2, sticky="w", pady=16)
         gen_btn = ttk.Button(gen_frame, text="Generate", command=self.generate)
         gen_btn.pack(side="left")
         ttk.Button(gen_frame, text="Start new order", command=self.start_new_order).pack(side="left", padx=(8, 0))
+        ttk.Label(left, text="Generate opens a Save dialog — pick or confirm the folder there.",
+                  foreground="#777").grid(row=row, column=1, columnspan=2, sticky="w", pady=16, padx=(140, 0))
 
         row += 1
         self.status = ttk.Label(left, text="", foreground="#0a7d2c", wraplength=520, justify="left")
@@ -1691,19 +1681,6 @@ class SingleOrderTab(ttk.Frame):
             messagebox.showerror("Not a usable PDF", error)
             return
         self.production_order_path.set(p)
-
-    def pick_out_dir(self):
-        p = filedialog.askdirectory(title="Choose output folder")
-        if p:
-            self.out_dir.set(p)
-
-    def set_default_out_dir(self):
-        p = self.out_dir.get().strip()
-        if not p or not os.path.isdir(p):
-            messagebox.showerror("Invalid folder", "Choose or type a valid, existing folder first.")
-            return
-        engine.set_default_output_dir(p)
-        messagebox.showinfo("Default saved", f"New orders will default to saving here:\n\n{p}\n\nYou can still change it per-order.")
 
     def _resolve_production_meta(self):
         """Merge a production-order-PDF parse with the manual raw
@@ -1984,6 +1961,29 @@ class SingleOrderTab(ttk.Frame):
         if ctx is None:
             return
 
+        # Ask where to save every time, pre-filled with the usual default
+        # folder + suggested name, rather than silently writing there --
+        # lets you redirect a specific order without having to change the
+        # default folder first. Cancelling the dialog cancels Generate too,
+        # same as any normal Save As.
+        chosen_path = filedialog.asksaveasfilename(
+            title="Save production markup as",
+            initialdir=str(Path(ctx["out_path"]).parent),
+            initialfile=Path(ctx["out_path"]).name,
+            defaultextension=".pdf",
+            filetypes=[("PDF", "*.pdf")],
+        )
+        if not chosen_path:
+            return
+        ctx["out_path"] = chosen_path
+        self.out_dir.set(str(Path(chosen_path).parent))
+        self.out_name.set(Path(chosen_path).name)
+        # remembered as the next dialog's starting folder, both this
+        # session (self.out_dir above) and future launches -- replaces the
+        # old explicit "Set as default" button now that every save already
+        # goes through this dialog
+        engine.set_default_output_dir(str(Path(chosen_path).parent))
+
         self.status.config(text="Working…", foreground="#555")
         self.update_idletasks()
 
@@ -1998,9 +1998,19 @@ class SingleOrderTab(ttk.Frame):
             wide_origin = self.layout.wide_origin
             brackets = self.layout.get_brackets()  # manual nudge(s)/rotation(s) from the live preview, if any
             bar_offset = self.layout.get_bar_offset()  # manual nudge for the Traveler bar, if any
+            page_rotation = self.layout.bg_rotation
             if self.layout.bg_rotation or abs(self.layout.bg_scale - 1.0) > 0.001:
                 order_form_for_merge = engine.get_transformed_order_form(
                     ctx["order_form"], self.layout.bg_rotation, self.layout.bg_scale)
+            if self.layout.bg_rotation:
+                # Rotating the background swaps its width/height -- without
+                # also rotating the overlay's own coordinates to match,
+                # merge_pdf()'s scale_to() has to squash it non-uniformly to
+                # fit, visibly stretching the dimension text/lines (the
+                # background itself doesn't stretch since it's rotated as a
+                # proper image, not just scaled).
+                items, brackets = engine.rotate_overlay_for_page(
+                    ctx["profile"], wide_origin, items, brackets, self.layout.bg_rotation)
         else:
             items = engine.compute_default_items(ctx["profile"], ctx["oversize_w"], ctx["oversize_h"],
                                                    thickness=ctx["thickness"])
@@ -2008,9 +2018,11 @@ class SingleOrderTab(ttk.Frame):
             wide_origin = ctx["wide_origin"]
             brackets = [{"offset": (0.0, 0.0), "rotation": 0}]
             bar_offset = (0.0, 0.0)
+            page_rotation = 0
         try:
             overlay_bytes = engine.render_page(ctx["profile"], ctx["material"], items, wide_origin=wide_origin,
-                                                brackets=brackets, bar_offset=bar_offset)
+                                                brackets=brackets, bar_offset=bar_offset,
+                                                page_rotation=page_rotation)
             engine.merge_pdf(order_form_for_merge, ctx["production_order"], overlay_bytes, ctx["out_path"])
         except Exception as e:
             traceback.print_exc()
@@ -2074,6 +2086,46 @@ class SingleOrderTab(ttk.Frame):
                             foreground=status_color)
 
 
+def _install_entry_context_menu(root):
+    """Right-click Cut/Copy/Paste/Select All for every text-entry widget in
+    the app (ttk.Entry, ttk.Combobox's internal entry, and the plain
+    tk.Entry inside simpledialog.askstring dialogs). macOS's native Aqua
+    text fields get this for free; Windows Tk does not, so right-click did
+    nothing there. Scoped to non-Mac only so it can't interfere with
+    whatever Mac already provides."""
+    if platform.system() == "Darwin":
+        return
+
+    menu = tk.Menu(root, tearoff=0)
+
+    def _do(virtual_event):
+        widget = root.focus_get()
+        if widget is not None:
+            widget.event_generate(virtual_event)
+
+    def _select_all():
+        widget = root.focus_get()
+        if widget is not None:
+            try:
+                widget.selection_range(0, tk.END)
+            except tk.TclError:
+                pass
+
+    menu.add_command(label="Cut", command=lambda: _do("<<Cut>>"))
+    menu.add_command(label="Copy", command=lambda: _do("<<Copy>>"))
+    menu.add_command(label="Paste", command=lambda: _do("<<Paste>>"))
+    menu.add_separator()
+    menu.add_command(label="Select All", command=_select_all)
+
+    def show_menu(event):
+        event.widget.focus_set()
+        menu.tk_popup(event.x_root, event.y_root)
+        return "break"
+
+    for cls in ("TEntry", "TCombobox", "Entry"):
+        root.bind_class(cls, "<Button-3>", show_menu)
+
+
 def main():
     global DND_AVAILABLE
     root = None
@@ -2091,6 +2143,7 @@ def main():
     root.title("KBRS Production Markup")
     root.geometry("1360x900")
     root.minsize(1000, 600)
+    _install_entry_context_menu(root)
 
     ACCENT_PRESETS = [
         ("Orange", "#f2842f"),
@@ -2135,6 +2188,73 @@ def main():
     top_bar.pack(fill="x", padx=8, pady=(6, 0))
     ttk.Button(top_bar, text="Accent color…", command=pick_accent_color).pack(side="right")
 
+    # -- self-update (Windows packaged build only; a no-op everywhere else,
+    # including this Mac dev build) -------------------------------------
+    update_btn = ttk.Button(top_bar, text="")
+    _pending_update_sha = {"sha": None}
+
+    def _do_update():
+        sha = _pending_update_sha["sha"]
+        if not sha:
+            return
+        if not messagebox.askyesno(
+            "Update available",
+            f"A newer version is available (build {sha[:7]}).\n\n"
+            "Download and install it now? The app will close and reopen "
+            "automatically once it's done.",
+        ):
+            return
+        update_btn.config(text="Downloading update…", state="disabled")
+        root.update_idletasks()
+
+        def worker():
+            try:
+                def progress(read, total):
+                    if total > 0:
+                        pct = int(read * 100 / total)
+                        root.after(0, lambda: update_btn.config(text=f"Downloading update… {pct}%"))
+                zip_path = engine.download_update(progress_cb=progress)
+                root.after(0, lambda: update_btn.config(text="Installing update…"))
+                staged_dir = engine.stage_update(zip_path)
+            except Exception as e:
+                traceback.print_exc()
+                root.after(0, lambda: (
+                    update_btn.config(text="🔄 Update available", state="normal"),
+                    messagebox.showerror(
+                        "Update failed",
+                        f"Couldn't download/prepare the update ({type(e).__name__}: {e}).\n\n"
+                        "The app hasn't been changed -- you can try again, or download it "
+                        "manually from the usual GitHub Releases link.",
+                    ),
+                ))
+                return
+            # apply_update_and_relaunch() exits the process itself -- nothing
+            # after this call runs (or needs to)
+            engine.apply_update_and_relaunch(staged_dir)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    update_btn.config(command=_do_update)
+
+    def _check_for_update_async(silent=True):
+        if not engine.is_frozen_windows_build():
+            return
+
+        def worker():
+            sha = engine.check_for_update()
+            if sha:
+                def show():
+                    _pending_update_sha["sha"] = sha
+                    update_btn.config(text="🔄 Update available")
+                    update_btn.pack(side="left")
+                root.after(0, show)
+            elif not silent:
+                root.after(0, lambda: messagebox.showinfo("Up to date", "You're already on the latest version."))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    _check_for_update_async(silent=True)  # on launch, quiet if already current
+
     tab = SingleOrderTab(root)
     tab.pack(fill="both", expand=True)
 
@@ -2146,6 +2266,9 @@ def main():
     menubar.add_cascade(label="File", menu=file_menu)
     recent_menu = tk.Menu(file_menu, tearoff=0)
     file_menu.add_cascade(label="Recent Orders", menu=recent_menu)
+    if engine.is_frozen_windows_build():
+        file_menu.add_separator()
+        file_menu.add_command(label="Check for Updates…", command=lambda: _check_for_update_async(silent=False))
 
     def refresh_recent_menu():
         recent_menu.delete(0, "end")

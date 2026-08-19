@@ -90,8 +90,13 @@ import csv
 import json
 import math
 import os
+import platform
 import re
+import subprocess
+import sys
 import tempfile
+import urllib.request
+import zipfile
 from pathlib import Path
 
 import pikepdf
@@ -194,6 +199,182 @@ def clear_recent_orders() -> None:
         RECENT_ORDERS_PATH.write_text(json.dumps([]))
     except OSError:
         pass
+
+
+# ---------------------------------------------------------------------------
+# Self-update (Windows packaged build only). build-windows.yml stamps every
+# build with the git commit SHA it was built from, both bundled next to the
+# exe as version.txt and uploaded standalone as its own tiny release asset --
+# the running app can cheaply check "is a newer build published?" on launch
+# without downloading the whole ~32MB zip just to find out, then download and
+# apply it itself if the user asks to. Every step here is best-effort and
+# fails safe: a failed check/download/stage never touches the current,
+# working install; only apply_update_and_relaunch() (called after a
+# successful download+stage) touches it, and even that keeps the old install
+# intact until the new one is confirmed in place.
+# ---------------------------------------------------------------------------
+GITHUB_REPO = "kbrs-dev/K-COFs-app"
+UPDATE_RELEASE_TAG = "windows-latest-build"
+_RELEASE_BASE = f"https://github.com/{GITHUB_REPO}/releases/download/{UPDATE_RELEASE_TAG}"
+UPDATE_VERSION_URL = f"{_RELEASE_BASE}/version.txt"
+UPDATE_ZIP_URL = f"{_RELEASE_BASE}/KBRS-Markup-Windows.zip"
+
+
+def is_frozen_windows_build() -> bool:
+    """True only for an actual packaged Windows .exe (not the Mac build,
+    and not a `python3 app.py` source run) -- the only case self-update
+    applies to."""
+    return bool(getattr(sys, "frozen", False)) and platform.system() == "Windows"
+
+
+def get_local_version() -> str | None:
+    """The git commit SHA this running build was made from. None if this
+    isn't a frozen Windows build, or version.txt is missing (e.g. a build
+    from before this feature existed)."""
+    if not is_frozen_windows_build():
+        return None
+    try:
+        return (Path(os.path.dirname(sys.executable)) / "version.txt").read_text().strip() or None
+    except OSError:
+        return None
+
+
+def get_remote_version(timeout: float = 10.0) -> str | None:
+    """The latest published build's commit SHA. None on any network/read
+    failure -- update checks are always best-effort and must never block or
+    interrupt using the app."""
+    try:
+        with urllib.request.urlopen(UPDATE_VERSION_URL, timeout=timeout) as resp:
+            return resp.read().decode("utf-8").strip() or None
+    except Exception:
+        return None
+
+
+def check_for_update() -> str | None:
+    """The newer version's commit SHA if an update is available, else None
+    (already up to date, or the check doesn't apply/failed)."""
+    local = get_local_version()
+    if local is None:
+        return None
+    remote = get_remote_version()
+    if remote is None or remote == local:
+        return None
+    return remote
+
+
+def download_update(progress_cb=None) -> str:
+    """Downloads the latest Windows build zip to a temp file and returns its
+    path. progress_cb(bytes_read, total_bytes), if given, is called
+    periodically (total_bytes is -1 if the server didn't send a length)."""
+    fd, zip_path = tempfile.mkstemp(suffix=".zip", prefix="kbrs_update_")
+    os.close(fd)
+    with urllib.request.urlopen(UPDATE_ZIP_URL, timeout=30) as resp:
+        total = int(resp.headers.get("Content-Length", -1))
+        read = 0
+        with open(zip_path, "wb") as f:
+            while True:
+                chunk = resp.read(1024 * 256)
+                if not chunk:
+                    break
+                f.write(chunk)
+                read += len(chunk)
+                if progress_cb:
+                    progress_cb(read, total)
+    return zip_path
+
+
+def stage_update(zip_path: str) -> str:
+    """Extracts the downloaded zip to a fresh temp staging folder and
+    returns the path to the extracted 'KBRS Markup' folder inside it. Never
+    touches the current install -- if this raises, nothing has changed."""
+    staging_root = tempfile.mkdtemp(prefix="kbrs_update_staged_")
+    with zipfile.ZipFile(zip_path) as zf:
+        zf.extractall(staging_root)
+    staged_app_dir = os.path.join(staging_root, "KBRS Markup")
+    if not os.path.isdir(staged_app_dir):
+        raise RuntimeError(
+            f"Downloaded update zip didn't contain a 'KBRS Markup' folder as expected "
+            f"(found: {os.listdir(staging_root)})"
+        )
+    return staged_app_dir
+
+
+def apply_update_and_relaunch(staged_app_dir: str) -> None:
+    """Writes a small batch script that waits for this process to fully
+    exit (releasing its file locks), swaps the staged new build into place,
+    relaunches the app, and cleans up after itself -- then launches that
+    script as a fully detached process and exits this one immediately so
+    the swap can proceed. If the swap fails for any reason, the script
+    restores the previous install rather than leaving a half-updated,
+    broken folder; if it can never get exclusive access at all, it gives up
+    and relaunches whatever's already there. Only call this after
+    stage_update() has already succeeded -- the current install isn't
+    touched until this point."""
+    app_dir = os.path.dirname(sys.executable)
+    exe_name = os.path.basename(sys.executable)
+    staging_root = os.path.dirname(staged_app_dir)
+    old_dir = app_dir + "_old"
+    old_dir_name = os.path.basename(old_dir)
+
+    bat_fd, bat_path = tempfile.mkstemp(suffix=".bat", prefix="kbrs_apply_update_")
+    os.close(bat_fd)
+
+    script = (
+        "@echo off\r\n"
+        "setlocal\r\n"
+        f'set "APP_DIR={app_dir}"\r\n'
+        f'set "OLD_DIR={old_dir}"\r\n'
+        f'set "OLD_DIR_NAME={old_dir_name}"\r\n'
+        f'set "STAGED_DIR={staged_app_dir}"\r\n'
+        f'set "STAGING_ROOT={staging_root}"\r\n'
+        f'set "EXE_NAME={exe_name}"\r\n'
+        "\r\n"
+        'if exist "%OLD_DIR%" rmdir /s /q "%OLD_DIR%" >nul 2>&1\r\n'
+        "\r\n"
+        "set tries=0\r\n"
+        ":waitloop\r\n"
+        'ren "%APP_DIR%" "%OLD_DIR_NAME%" >nul 2>&1\r\n'
+        'if exist "%OLD_DIR%" goto renamed\r\n'
+        "set /a tries+=1\r\n"
+        "if %tries% GEQ 30 goto giveup\r\n"
+        "timeout /t 1 /nobreak >nul\r\n"
+        "goto waitloop\r\n"
+        "\r\n"
+        ":renamed\r\n"
+        'move /y "%STAGED_DIR%" "%APP_DIR%" >nul 2>&1\r\n'
+        'if exist "%APP_DIR%\\%EXE_NAME%" goto success\r\n'
+        "\r\n"
+        "REM the move failed -- restore the previous install so the app still works\r\n"
+        'rmdir /s /q "%APP_DIR%" >nul 2>&1\r\n'
+        'move /y "%OLD_DIR%" "%APP_DIR%" >nul 2>&1\r\n'
+        'start "" "%APP_DIR%\\%EXE_NAME%"\r\n'
+        "goto cleanup\r\n"
+        "\r\n"
+        ":success\r\n"
+        'rmdir /s /q "%OLD_DIR%" >nul 2>&1\r\n'
+        'start "" "%APP_DIR%\\%EXE_NAME%"\r\n'
+        "goto cleanup\r\n"
+        "\r\n"
+        ":giveup\r\n"
+        "REM couldn't get exclusive access after 30s -- give up and relaunch\r\n"
+        "REM whatever's there rather than leaving the app closed\r\n"
+        'start "" "%APP_DIR%\\%EXE_NAME%"\r\n'
+        "goto cleanup\r\n"
+        "\r\n"
+        ":cleanup\r\n"
+        'rmdir /s /q "%STAGING_ROOT%" >nul 2>&1\r\n'
+        'del "%~f0"\r\n'
+    )
+    Path(bat_path).write_text(script)
+
+    DETACHED_PROCESS = 0x00000008
+    CREATE_NEW_PROCESS_GROUP = 0x00000200
+    subprocess.Popen(
+        ["cmd.exe", "/c", bat_path],
+        creationflags=DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP,
+        close_fds=True,
+    )
+    os._exit(0)
 
 
 ORANGE = _hex_to_color(get_accent_hex())
@@ -603,20 +784,36 @@ def parse_production_order(pdf_path: str) -> dict:
     promised_date = grab("Promised Date:")
     so_number = grab("SO Number:")
 
-    # ITEM line, dimensions appear as either (33 1/4"x34 1/2") or (47-1/2 x 33)
+    # ITEM line, dimensions appear as either (33 1/4"x34 1/2") or (47-1/2 x 33).
+    # Case-insensitive: some production orders separate dimensions with a
+    # capital "X" (e.g. '60 1/2" X 43 1/2"') instead of lowercase -- a plain
+    # lowercase-only "x" here silently failed to parse those (real example:
+    # 'CTB-2601-2900: ... 60 1/2" X 43 1/2"').
     item_match = re.search(
-        r'([A-Z]+-[\w-]+):\s*(.+?)\s*\(([\d\s/-]+)"?\s*x\s*([\d\s/-]+)"?\)', text
+        r'([A-Z]+-[\w-]+):\s*(.+?)\s*\(([\d\s/-]+)"?\s*x\s*([\d\s/-]+)"?\)', text, re.IGNORECASE
     )
     if not item_match:
         # Some production orders print dimensions directly after the item
         # name with no parentheses at all, e.g. '...ShowerSlope  80 1/4" x
-        # 60" 4701-5000 sq. inches.'. Tried only as a fallback (not merged
-        # into the pattern above) and the inch mark is required here, unlike
-        # the parenthesized form -- without that anchor, a stray number
-        # embedded in the item name could get mistaken for the real
-        # dimensions.
+        # 60" 4701-5000 sq. inches.', and some real orders omit the inch
+        # mark on the first number only, e.g. '85 5/8 x 41"'. The second
+        # number's inch mark is required as the anchor -- without it, a
+        # stray number embedded in the item name could get mistaken for the
+        # real dimensions.
         item_match = re.search(
-            r'([A-Z]+-[\w-]+):\s*(.+?)\s*([\d\s/-]+)"\s*x\s*([\d\s/-]+)"', text
+            r'([A-Z]+-[\w-]+):\s*(.+?)\s*([\d\s/-]+)"?\s*x\s*([\d\s/-]+)"', text, re.IGNORECASE
+        )
+    if not item_match:
+        # Rarer real-world formats seen on actual production orders: neither
+        # number has an inch mark at all ('60 x 53 HARD CURB'), or the "x"
+        # separator itself got mangled into a stray '"' during PDF text
+        # extraction ('60 1/2" " 45"'). Neither has a reliable inch-mark
+        # anchor, so this tier anchors on the "sq. in./sq. inches." text
+        # that KBRS's own production-order generator always prints directly
+        # before the dimensions instead.
+        item_match = re.search(
+            r'([A-Z]+-[\w-]+):\s*(.+?sq\.\s*in\w*\.)\s*([\d\s/-]+)"?\s*(?:x|")\s*([\d\s/-]+)"?',
+            text, re.IGNORECASE
         )
     if not item_match:
         raise ValueError(f"Could not find item/dimension line in {pdf_path}. Raw text:\n{text}")
@@ -766,6 +963,80 @@ def rotate_point(pt: tuple, pivot: tuple, degrees: float) -> tuple:
     return (pivot[0] + dx, pivot[1] + dy)
 
 
+def _rotate_page_point(x: float, y: float, page_rotation: int) -> tuple:
+    """Where (x, y) on the unrotated PAGE_W x PAGE_H canonical page ends up
+    after rotating the WHOLE PAGE (not the point around its own pivot) by
+    page_rotation degrees (must be a multiple of 90), re-anchored so the
+    result still starts at (0, 0) -- the same transform a PDF's own /Rotate
+    represents, applied directly to overlay coordinates instead of as page
+    metadata (get_transformed_order_form()'s docstring explains why that
+    distinction matters for the background image; this is the overlay's
+    equivalent, used to keep it from getting non-uniformly stretched by
+    merge_pdf()'s scale_to() when the background has been rotated)."""
+    page_rotation = page_rotation % 360
+    if page_rotation == 90:
+        return PAGE_H - y, x
+    if page_rotation == 180:
+        return PAGE_W - x, PAGE_H - y
+    if page_rotation == 270:
+        return y, PAGE_W - x
+    return x, y
+
+
+def _rotate_bracket_for_page(profile: dict, wide_origin: bool, bracket: dict, page_rotation: int) -> dict:
+    """A bracket's offset/rotation describe a delta from the profile's
+    calibrated base shape, not an absolute position, so it can't just be
+    point-rotated like a plain (x, y) item -- this re-derives an equivalent
+    offset (matching the elbow's new, page-rotated position) and rotation
+    (the existing manual rotation plus the page's own) that reproduce the
+    bracket's correctly page-rotated shape when re-run through
+    _bracket_points()."""
+    base_pts = profile["bracket_wide"] if (wide_origin and "bracket_wide" in profile) else profile["bracket"]
+    base_elbow = base_pts[1]
+    current_elbow = _bracket_points(profile, wide_origin, bracket["offset"], bracket["rotation"])[1]
+    target_elbow = _rotate_page_point(current_elbow[0], current_elbow[1], page_rotation)
+    new_offset = (target_elbow[0] - base_elbow[0], target_elbow[1] - base_elbow[1])
+    new_rotation = (bracket["rotation"] + page_rotation) % 360
+    return {"offset": new_offset, "rotation": new_rotation}
+
+
+def rotate_overlay_for_page(profile: dict, wide_origin: bool, items: list, brackets: list,
+                             page_rotation: int) -> tuple:
+    """Repositions overlay items and bracket(s) to match a background
+    that's been rotated by page_rotation degrees (see
+    InteractiveLayout._rotate_background() in app.py) -- without this,
+    merge_pdf()'s final scale_to() has to non-uniformly squash the overlay
+    to fit the rotated page's swapped aspect ratio, visibly stretching
+    dimension text/lines instead of just repositioning them. Text itself is
+    repositioned but not rotated (numbers stay upright and readable, same
+    as normal drafting convention). A no-op if page_rotation is 0. Scoped
+    to items + brackets -- the material bar isn't repositioned by this yet."""
+    page_rotation = page_rotation % 360
+    if page_rotation == 0:
+        return items, brackets
+
+    new_items = []
+    for item in items:
+        new_item = dict(item)
+        if item["kind"] == "line":
+            new_item["x0"], new_item["y0"] = _rotate_page_point(item["x0"], item["y0"], page_rotation)
+            new_item["x1"], new_item["y1"] = _rotate_page_point(item["x1"], item["y1"], page_rotation)
+        else:
+            new_item["x"], new_item["y"] = _rotate_page_point(item["x"], item["y"], page_rotation)
+            if item.get("fixed_cover"):
+                fx0, fy0, fx1, fy1 = item["fixed_cover"]
+                p0 = _rotate_page_point(fx0, fy0, page_rotation)
+                p1 = _rotate_page_point(fx1, fy1, page_rotation)
+                new_item["fixed_cover"] = (
+                    min(p0[0], p1[0]), min(p0[1], p1[1]),
+                    max(p0[0], p1[0]), max(p0[1], p1[1]),
+                )
+        new_items.append(new_item)
+
+    new_brackets = [_rotate_bracket_for_page(profile, wide_origin, b, page_rotation) for b in brackets]
+    return new_items, new_brackets
+
+
 def _material_bar_rect(profile: dict, material: str, bar_offset: tuple) -> tuple:
     bx0, by0, bx1, by1 = profile["material_bar"]
     bdx, bdy = bar_offset
@@ -790,13 +1061,19 @@ _DEFAULT_BRACKETS = [{"offset": (0.0, 0.0), "rotation": 0}]
 
 
 def _content_bbox(profile: dict, material: str, items: list, wide_origin: bool,
-                   brackets: list, bar_offset: tuple) -> tuple:
+                   brackets: list, bar_offset: tuple, page_rotation: int = 0) -> tuple:
     """Bounding box (min_x, min_y, max_x, max_y) of everything render_page()
     is about to draw, unioned with the normal (0,0)-(PAGE_W,PAGE_H) page so
     a bracket/bar/item dragged outside the normal page (e.g. after rotating
     the background drawing) never gets silently clipped on export -- the
-    whole overlay gets sized to include it instead, however far out it is."""
-    min_x, min_y, max_x, max_y = 0.0, 0.0, PAGE_W, PAGE_H
+    whole overlay gets sized to include it instead, however far out it is.
+    When page_rotation is 90/270, the floor swaps to (PAGE_H, PAGE_W) to
+    match rotate_overlay_for_page()'s already-repositioned (landscape, if
+    the canonical page is portrait) content -- without this, the floor
+    would force the overlay back into its original (now wrong) shape and
+    undo that fix."""
+    floor_w, floor_h = (PAGE_H, PAGE_W) if page_rotation % 180 == 90 else (PAGE_W, PAGE_H)
+    min_x, min_y, max_x, max_y = 0.0, 0.0, floor_w, floor_h
 
     def extend(x, y):
         nonlocal min_x, min_y, max_x, max_y
@@ -827,20 +1104,27 @@ def _content_bbox(profile: dict, material: str, items: list, wide_origin: bool,
 
 
 def render_page(profile: dict, material: str, items: list, wide_origin: bool = False,
-                 brackets: list = None, bar_offset: tuple = (0.0, 0.0)) -> bytes:
+                 brackets: list = None, bar_offset: tuple = (0.0, 0.0), page_rotation: int = 0) -> bytes:
     # brackets is a list of {"offset": (dx,dy), "rotation": 0/90/180/270} --
     # some orders need more than one CNC/CAD reference point. Defaults to a
     # single un-adjusted bracket at the calibrated position.
     if brackets is None:
         brackets = _DEFAULT_BRACKETS
 
+    # page_rotation only affects the auto-grow floor's shape (see
+    # _content_bbox) -- callers rotating the background are expected to
+    # have already run items/brackets through rotate_overlay_for_page()
+    # themselves; this just keeps the floor from forcing the result back
+    # into the wrong (unrotated) shape.
+    #
     # Everything is normally within the calibrated (0,0)-(PAGE_W,PAGE_H) box,
     # but a manually dragged bracket/bar/item can end up outside it -- size
     # the overlay's own page to whatever actually needs to fit (never
     # smaller than the normal page) and shift every draw call by the box's
     # origin, so nothing is ever silently cut off. merge_pdf() then scales
     # this correctly-sized overlay onto the real target page as usual.
-    min_x, min_y, max_x, max_y = _content_bbox(profile, material, items, wide_origin, brackets, bar_offset)
+    min_x, min_y, max_x, max_y = _content_bbox(profile, material, items, wide_origin, brackets, bar_offset,
+                                                page_rotation)
     off_x, off_y = -min_x, -min_y
     page_w, page_h = max_x - min_x, max_y - min_y
 
