@@ -1991,7 +1991,10 @@ class SingleOrderTab(ttk.Frame):
         # edits, notes, or a cut-for-shipping line) if it matches this exact
         # order; otherwise fall back to fresh default positions
         matches = self.layout.matches(ctx["order_form"], ctx["production_order"])
-        order_form_for_merge = ctx["order_form"]
+        # Always normalized to a portrait PAGE_W x PAGE_H page (see
+        # normalize_to_portrait_page()) even with no manual rotate/resize --
+        # only overridden below if bg_rotation/bg_scale add something on top.
+        order_form_for_merge = engine.get_transformed_order_form(ctx["order_form"])
         if matches:
             items = self.layout.get_items()
             oversize_w = self.layout.oversize_w  # includes the cut-for-shipping bump, if present

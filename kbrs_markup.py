@@ -510,23 +510,88 @@ def get_page_size(order_form_pdf: str) -> tuple:
 
 
 _BG_TRANSFORM_CACHE = {}  # (path, mtime, rotation, scale) -> transformed pdf path
+_NORMALIZED_PAGE_CACHE = {}  # (path, mtime) -> normalized-to-portrait pdf path
+_BG_RENDER_SCALE = 2.5  # comfortably print-quality even after a downscale
+
+
+def _render_pil(pdf_path: str):
+    import pypdfium2 as pdfium  # local import: only needed for this rare path
+    pdf = pdfium.PdfDocument(pdf_path)
+    pil_img = pdf[0].render(scale=_BG_RENDER_SCALE).to_pil()
+    pdf.close()
+    return pil_img
+
+
+def _wrap_pil_as_pdf(pil_img, page_w: float, page_h: float, offset_x: float = 0.0,
+                      offset_y: float = 0.0, draw_w: float = None, draw_h: float = None) -> str:
+    """Draws pil_img onto a fresh page_w x page_h PDF page at the given
+    offset/size (defaulting to filling the whole page), returns the path."""
+    if draw_w is None:
+        draw_w, draw_h = page_w, page_h
+    fd, out_path = tempfile.mkstemp(suffix=".pdf", prefix="kbrs_bgtransform_")
+    os.close(fd)
+    c = canvas.Canvas(out_path, pagesize=(page_w, page_h))
+    c.drawImage(ImageReader(pil_img), offset_x, offset_y, width=draw_w, height=draw_h)
+    c.save()
+    return out_path
+
+
+def normalize_to_portrait_page(order_form_path: str) -> str:
+    """Every exported/previewed order form page is always exactly
+    PAGE_W x PAGE_H (portrait Letter, 8.5x11) -- a landscape scan (common
+    for long linear panels) gets rotated to portrait first; whatever's left
+    over after that is fit inside the page preserving its own proportions
+    (never stretched/squished), centered with a blank margin on whichever
+    axis doesn't exactly fill it. This is the baseline get_transformed_
+    order_form() builds on -- combined with merge_pdf() now always scaling
+    by the fixed canonical->real ratio, the two together mean that ratio is
+    just 1:1 for the overwhelmingly common case, eliminating the whole
+    class of scale/aspect distortion bugs at the source rather than
+    reconciling them after the fact. Cached by path+mtime."""
+    base_path = ensure_pdf(order_form_path)
+    try:
+        mtime = os.path.getmtime(order_form_path)
+    except OSError:
+        mtime = None
+    cache_key = (order_form_path, mtime)
+    cached = _NORMALIZED_PAGE_CACHE.get(cache_key)
+    if cached and os.path.isfile(cached):
+        return cached
+
+    pil_img = _render_pil(base_path)
+    if pil_img.width > pil_img.height:
+        # landscape source -- rotate to portrait first (clockwise, matching
+        # the app's other 90-degree rotations, e.g. the manual "Rotate
+        # drawing 90 deg" control and the bracket/cut-line rotations)
+        pil_img = pil_img.rotate(-90, expand=True)
+
+    img_w_pts, img_h_pts = pil_img.width / _BG_RENDER_SCALE, pil_img.height / _BG_RENDER_SCALE
+    fit_scale = min(PAGE_W / img_w_pts, PAGE_H / img_h_pts)
+    draw_w, draw_h = img_w_pts * fit_scale, img_h_pts * fit_scale
+    offset_x, offset_y = (PAGE_W - draw_w) / 2, (PAGE_H - draw_h) / 2
+
+    out_path = _wrap_pil_as_pdf(pil_img, PAGE_W, PAGE_H, offset_x, offset_y, draw_w, draw_h)
+    _NORMALIZED_PAGE_CACHE[cache_key] = out_path
+    return out_path
 
 
 def get_transformed_order_form(order_form_path: str, rotation: int = 0, scale: float = 1.0) -> str:
-    """A version of the order-form PDF with the given rotation (0/90/180/270)
-    and scale (1.0 = unchanged) applied -- for reorienting/resizing a
-    drawing that was scanned sideways or is awkwardly small/large on the
-    page. Cached by path+mtime+rotation+scale. Returns the plain
-    ensure_pdf()-converted path unchanged if rotation is 0 and scale is 1.0.
+    """A version of the order-form PDF -- already normalized to a portrait
+    PAGE_W x PAGE_H page by normalize_to_portrait_page() -- with an
+    additional user-requested rotation (0/90/180/270) and scale (1.0 =
+    unchanged) applied on top, for reorienting/resizing a drawing that's
+    still awkward after the automatic normalization. Cached by
+    path+mtime+rotation+scale. Returns the plain normalized path unchanged
+    if rotation is 0 and scale is 1.0 (the default, by far the common case).
 
     Implemented by rendering the page to a high-resolution image and
     re-wrapping that at the transformed size (same approach ensure_pdf()
-    already uses for image scans), rather than a PDF-level rotate/scale --
-    a PDF page's /Rotate flag doesn't change its underlying raw content
+    uses for image scans), rather than a PDF-level rotate/scale -- a PDF
+    page's /Rotate flag doesn't change its underlying raw content
     coordinate space, and merge_pdf()'s overlay compositing operates in
     that raw space, so a metadata-only rotation would leave the overlay
     landing in the wrong place relative to the visibly-rotated background."""
-    base_path = ensure_pdf(order_form_path)
+    base_path = normalize_to_portrait_page(order_form_path)
     rotation = rotation % 360
     if rotation == 0 and abs(scale - 1.0) < 0.001:
         return base_path
@@ -539,12 +604,7 @@ def get_transformed_order_form(order_form_path: str, rotation: int = 0, scale: f
     if cached and os.path.isfile(cached):
         return cached
 
-    import pypdfium2 as pdfium  # local import: only needed for this rare path
-    render_scale = 2.5  # comfortably print-quality even after a downscale
-    pdf = pdfium.PdfDocument(base_path)
-    page = pdf[0]
-    pil_img = page.render(scale=render_scale).to_pil()
-    pdf.close()
+    pil_img = _render_pil(base_path)
     if rotation:
         # PIL rotates counter-clockwise for positive angles; PDF /Rotate and
         # the app's other 90-degree rotations (bracket, cut line) are
@@ -554,12 +614,8 @@ def get_transformed_order_form(order_form_path: str, rotation: int = 0, scale: f
         new_size = (max(1, round(pil_img.width * scale)), max(1, round(pil_img.height * scale)))
         pil_img = pil_img.resize(new_size)
 
-    fd, out_path = tempfile.mkstemp(suffix=".pdf", prefix="kbrs_bgtransform_")
-    os.close(fd)
-    page_w, page_h = pil_img.width / render_scale, pil_img.height / render_scale
-    c = canvas.Canvas(out_path, pagesize=(page_w, page_h))
-    c.drawImage(ImageReader(pil_img), 0, 0, width=page_w, height=page_h)
-    c.save()
+    page_w, page_h = pil_img.width / _BG_RENDER_SCALE, pil_img.height / _BG_RENDER_SCALE
+    out_path = _wrap_pil_as_pdf(pil_img, page_w, page_h)
     _BG_TRANSFORM_CACHE[cache_key] = out_path
     return out_path
 
@@ -1235,7 +1291,11 @@ def merge_pdf(order_form_pdf: str, production_order_pdf: str, overlay_bytes: byt
     normal page bounds -- see render_page()'s docstring). Required to place
     the overlay correctly; a caller passing pre-rendered bytes without them
     will misplace anything on a page that auto-grew."""
-    order_form_pdf = ensure_pdf(order_form_pdf)  # converts image scans (jpg/png/etc.) to PDF
+    # Always normalized to a portrait PAGE_W x PAGE_H page first (idempotent
+    # if the caller -- e.g. app.py's generate() -- already did this itself
+    # with a specific manual rotation/scale on top; harmless/no-op if
+    # order_form_pdf is already such a page).
+    order_form_pdf = get_transformed_order_form(order_form_pdf)
     overlay_reader = PdfReader(io.BytesIO(overlay_bytes))
     order_reader = PdfReader(order_form_pdf)
     prod_reader = PdfReader(production_order_pdf)
