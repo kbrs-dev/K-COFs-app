@@ -547,7 +547,18 @@ def normalize_to_portrait_page(order_form_path: str) -> str:
     by the fixed canonical->real ratio, the two together mean that ratio is
     just 1:1 for the overwhelmingly common case, eliminating the whole
     class of scale/aspect distortion bugs at the source rather than
-    reconciling them after the fact. Cached by path+mtime."""
+    reconciling them after the fact. Cached by path+mtime.
+
+    Deliberately does NOT auto-rotate a landscape-shaped source to portrait:
+    a landscape image could need +90 or -90 to read right-side-up depending
+    on which way the customer's camera/scanner happened to be turned, and
+    there's no reliable way to tell which from the image alone -- guessing
+    wrong actively swaps width/height calibration (worse than just leaving
+    it landscape-shaped, letterboxed here). Use the existing manual "Rotate
+    drawing" control for that; it already correctly repositions calibrated
+    items to match (see rotate_overlay_for_page()), since a human picking
+    the direction can just look at the result and try the other way if it's
+    wrong."""
     base_path = ensure_pdf(order_form_path)
     try:
         mtime = os.path.getmtime(order_form_path)
@@ -559,12 +570,6 @@ def normalize_to_portrait_page(order_form_path: str) -> str:
         return cached
 
     pil_img = _render_pil(base_path)
-    if pil_img.width > pil_img.height:
-        # landscape source -- rotate to portrait first (clockwise, matching
-        # the app's other 90-degree rotations, e.g. the manual "Rotate
-        # drawing 90 deg" control and the bracket/cut-line rotations)
-        pil_img = pil_img.rotate(-90, expand=True)
-
     img_w_pts, img_h_pts = pil_img.width / _BG_RENDER_SCALE, pil_img.height / _BG_RENDER_SCALE
     fit_scale = min(PAGE_W / img_w_pts, PAGE_H / img_h_pts)
     draw_w, draw_h = img_w_pts * fit_scale, img_h_pts * fit_scale
