@@ -238,6 +238,8 @@ class InteractiveLayout(ttk.Frame):
         # Traveler flange note for this order, so _sync_flange_note() doesn't
         # just re-add it on the next field edit -- reset per order load
         self._flange_note_dismissed = False
+        # same idea for the checkbox-driven Keyhole Linear drain-plate note
+        self._drain_plate_note_dismissed = False
 
         self.placeholder = ttk.Label(self, text="Load an order form to see it here", foreground="#777",
                                       background="#eeeeee", relief="sunken", wraplength=340, justify="center")
@@ -492,7 +494,7 @@ class InteractiveLayout(ttk.Frame):
         return True
 
     def load_new_order(self, order_form_path, production_order_path, profile, material,
-                        oversize_w, oversize_h, thickness, wide_origin, restore_state=None):
+                        oversize_w, oversize_h, thickness, wide_origin, keyhole_linear=False, restore_state=None):
         """A genuinely different order (or first load) -- resets items,
         undo history, and the cut-line state to fresh defaults, unless
         restore_state is given (reopening a recent order for a quick edit --
@@ -530,6 +532,10 @@ class InteractiveLayout(ttk.Frame):
                 engine.is_blue_traveler(material)
                 and not any(i["key"] == engine.FLANGE_NOTE_KEY for i in self.items)
             )
+            self._drain_plate_note_dismissed = (
+                keyhole_linear
+                and not any(i["key"] == engine.DRAIN_PLATE_NOTE_KEY for i in self.items)
+            )
         else:
             self.has_cut_line = False
             self.brackets = [{"offset": (0.0, 0.0), "rotation": 0}]
@@ -537,6 +543,8 @@ class InteractiveLayout(ttk.Frame):
             self.items = engine.compute_default_items(profile, oversize_w, oversize_h, thickness=thickness)
             self._flange_note_dismissed = False
             self._sync_flange_note(material)
+            self._drain_plate_note_dismissed = False
+            self._sync_drain_plate_note(keyhole_linear)
 
         self.bg_photo = ImageTk.PhotoImage(pil_img)
         self.preview_page = 1
@@ -560,7 +568,7 @@ class InteractiveLayout(ttk.Frame):
             "bg_scale": self.bg_scale,
         }
 
-    def sync(self, material, oversize_w, oversize_h, thickness, wide_origin):
+    def sync(self, material, oversize_w, oversize_h, thickness, wide_origin, keyhole_linear=False):
         """Same order, just a material/thickness/curb-depth field changed --
         update text and the material bar/bracket without touching anything
         the user has manually dragged, edited, or undo history."""
@@ -597,6 +605,7 @@ class InteractiveLayout(ttk.Frame):
             self.items.remove(thickness_item)
 
         self._sync_flange_note(material)
+        self._sync_drain_plate_note(keyhole_linear)
 
         if self._dragging_bracket is None and not self._bar_dragging:
             self._draw_static_bar_and_bracket()
@@ -620,6 +629,23 @@ class InteractiveLayout(ttk.Frame):
             return
         if not existing and not self._flange_note_dismissed:
             item = engine.make_flange_note_item()
+            self.items.append(item)
+            if self.loaded:
+                self._draw_item(item)
+
+    def _sync_drain_plate_note(self, needed):
+        """Keyhole Linear orders (checkbox, not auto-detected) need a
+        'DRAIN PLATE NEEDED' note in the accent color -- same on/off/
+        dismiss-tracking pattern as _sync_flange_note above."""
+        existing = next((i for i in self.items if i["key"] == engine.DRAIN_PLATE_NOTE_KEY), None)
+        if not needed:
+            self._drain_plate_note_dismissed = False
+            if existing and self.drag_key != engine.DRAIN_PLATE_NOTE_KEY:
+                self._clear_canvas_for(engine.DRAIN_PLATE_NOTE_KEY)
+                self.items.remove(existing)
+            return
+        if not existing and not self._drain_plate_note_dismissed:
+            item = engine.make_drain_plate_note_item()
             self.items.append(item)
             if self.loaded:
                 self._draw_item(item)
@@ -1129,6 +1155,8 @@ class InteractiveLayout(ttk.Frame):
         self.items.remove(item)
         if key == engine.FLANGE_NOTE_KEY:
             self._flange_note_dismissed = True
+        if key == engine.DRAIN_PLATE_NOTE_KEY:
+            self._drain_plate_note_dismissed = True
         if key == "cut_line":
             # also drop the paired label and revert the oversize bump from
             # whichever axis it's currently on (may have been rotated since
@@ -1235,6 +1263,9 @@ class SingleOrderTab(ttk.Frame):
         # varies per order, not by product type, so it's a per-order toggle
         # rather than baked into the CTB/CLTB profile.
         self.curb_affects_width = tk.BooleanVar(value=False)
+        # Keyhole Linear orders need a drain plate -- checked here adds a
+        # "DRAIN PLATE NEEDED" note to the drawing in the accent color.
+        self.keyhole_linear = tk.BooleanVar(value=False)
         # Raw width/height normally come from parsing the production order
         # PDF's text -- these are the manual fallback/override for when that
         # parse fails or gets a handwritten/nonstandard order wrong, same
@@ -1401,6 +1432,12 @@ class SingleOrderTab(ttk.Frame):
             row=row, column=1, columnspan=2, sticky="w", padx=(180, 0)
         )
         row += 1
+        ttk.Checkbutton(
+            left, text="Keyhole Linear", variable=self.keyhole_linear,
+        ).grid(row=row, column=0, sticky="w", pady=(4, 0))
+        ttk.Label(left, text='Adds a "DRAIN PLATE NEEDED" note to the drawing, in the accent color.',
+                  foreground="#777").grid(row=row, column=1, columnspan=2, sticky="w", pady=(4, 0))
+        row += 1
 
         ttk.Label(left, text='4. Drain dimension "A" (Linear ShowerSlope/Tile-Basin only)', font=("", 12, "bold")).grid(
             row=row, column=0, columnspan=3, sticky="w", pady=(10, 4)
@@ -1498,7 +1535,7 @@ class SingleOrderTab(ttk.Frame):
         # auto-refresh the live preview whenever any relevant field changes
         for var in (self.order_form_path, self.production_order_path, self.material,
                     self.thickness, self.drain_a, self.curb_depth, self.curb_affects_width,
-                    self.raw_width, self.raw_height, self.product_type_override):
+                    self.keyhole_linear, self.raw_width, self.raw_height, self.product_type_override):
             var.trace_add("write", lambda *_: self._schedule_preview_update())
         self._schedule_preview_update()
 
@@ -1652,11 +1689,13 @@ class SingleOrderTab(ttk.Frame):
         if self._loaded_signature != sig:
             ok = self.layout.load_new_order(order_form, production_order, profile, material,
                                              oversize_w, oversize_h, thickness, bool(wide_origin),
+                                             keyhole_linear=self.keyhole_linear.get(),
                                              restore_state=self._pending_restore_state)
             self._pending_restore_state = None
             self._loaded_signature = sig if ok else None
         else:
-            self.layout.sync(material, oversize_w, oversize_h, thickness, bool(wide_origin))
+            self.layout.sync(material, oversize_w, oversize_h, thickness, bool(wide_origin),
+                              keyhole_linear=self.keyhole_linear.get())
 
     def pick_order_form(self):
         p = filedialog.askopenfilename(
@@ -1906,6 +1945,7 @@ class SingleOrderTab(ttk.Frame):
         self.drain_a.set(entry.get("drain_a", ""))
         self.curb_depth.set(entry.get("curb_depth", ""))
         self.curb_affects_width.set(entry.get("curb_affects_width", False))
+        self.keyhole_linear.set(entry.get("keyhole_linear", False))
         self.raw_width.set(entry.get("raw_width", ""))
         self.raw_height.set(entry.get("raw_height", ""))
         self.product_type_override.set(entry.get("product_type_override", ""))
@@ -1937,6 +1977,7 @@ class SingleOrderTab(ttk.Frame):
         self.product_type_override.set("")
         self.curb_depth.set("")
         self.curb_affects_width.set(False)
+        self.keyhole_linear.set(False)
         self.out_name.set("")
         self._last_auto_thickness = None
         self._autoread_attempted_for = None
@@ -2048,6 +2089,7 @@ class SingleOrderTab(ttk.Frame):
                 "drain_a": self.drain_a.get().strip(),
                 "curb_depth": self.curb_depth.get().strip(),
                 "curb_affects_width": self.curb_affects_width.get(),
+                "keyhole_linear": self.keyhole_linear.get(),
                 "raw_width": self.raw_width.get().strip(),
                 "raw_height": self.raw_height.get().strip(),
                 "product_type_override": self.product_type_override.get().strip(),

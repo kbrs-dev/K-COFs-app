@@ -1004,6 +1004,24 @@ def make_flange_note_item() -> dict:
     }
 
 
+# Keyhole Linear orders need a drain plate -- toggled by a checkbox (not
+# material-driven, unlike the flange note above) rather than auto-detected,
+# since it's a configuration choice, not implied by anything else on the
+# order. "orange" here is the app's configurable accent-color key (see
+# COLOR_MAP/set_accent_color), not literally orange, matching the request
+# for it to show in "the highlighted accent color."
+DRAIN_PLATE_NOTE_KEY = "drain_plate_note"
+DRAIN_PLATE_NOTE_TEXT = "DRAIN PLATE NEEDED"
+
+
+def make_drain_plate_note_item() -> dict:
+    return {
+        "key": DRAIN_PLATE_NOTE_KEY, "kind": "text", "text": DRAIN_PLATE_NOTE_TEXT,
+        "x": PAGE_W / 2 - 130, "y": 120.0, "font_size": 20, "color": "orange",
+        "fixed_cover": None, "moved": True, "deletable": True, "editable_text": True,
+    }
+
+
 def rotate_point(pt: tuple, pivot: tuple, degrees: float) -> tuple:
     """Rotate pt around pivot by any angle. Exact multiples of 90 take a
     fast path with plain dx/dy swaps (no float drift); anything else (e.g.
