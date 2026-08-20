@@ -2287,7 +2287,26 @@ def main():
             return
 
         def worker():
-            sha = engine.check_for_update()
+            try:
+                sha = engine.check_for_update()
+            except engine.UpdateCheckError as e:
+                # A failed check is NOT the same as "up to date" -- silently
+                # treating it that way is exactly how a real network problem
+                # once got reported as "you're current" when it wasn't.
+                # Quiet on the automatic launch-time check (don't nag every
+                # startup over a transient network blip); loud when someone
+                # explicitly asked via File > Check for Updates, since they
+                # need to know the check itself didn't work.
+                if not silent:
+                    root.after(0, lambda: messagebox.showerror(
+                        "Couldn't check for updates",
+                        "The update check itself failed, so this does NOT mean "
+                        "you're up to date -- it just couldn't reach the update server:\n\n"
+                        f"{e}\n\n"
+                        "Check your internet connection and try again, or download "
+                        "manually from the usual GitHub Releases link."
+                    ))
+                return
             if sha:
                 def show():
                     _pending_update_sha["sha"] = sha

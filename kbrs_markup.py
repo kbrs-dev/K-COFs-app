@@ -239,25 +239,39 @@ def get_local_version() -> str | None:
         return None
 
 
-def get_remote_version(timeout: float = 10.0) -> str | None:
-    """The latest published build's commit SHA. None on any network/read
-    failure -- update checks are always best-effort and must never block or
-    interrupt using the app."""
+class UpdateCheckError(Exception):
+    """Raised when the check itself fails (network/timeout/unexpected
+    response) -- distinct from a successful check that just finds no newer
+    build, so callers can tell you "the check failed" instead of falsely
+    claiming you're already up to date. That distinction was missing before
+    (get_remote_version() silently returning None either way), which is
+    exactly how a real network failure got reported as "up to date"."""
+
+
+def get_remote_version(timeout: float = 10.0) -> str:
+    """The latest published build's commit SHA. Raises UpdateCheckError
+    (never silently swallowed) if the request fails for any reason."""
+    req = urllib.request.Request(UPDATE_VERSION_URL, headers={"User-Agent": "KBRS-Markup-Updater"})
     try:
-        with urllib.request.urlopen(UPDATE_VERSION_URL, timeout=timeout) as resp:
-            return resp.read().decode("utf-8").strip() or None
-    except Exception:
-        return None
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            text = resp.read().decode("utf-8").strip()
+    except Exception as e:
+        raise UpdateCheckError(f"{type(e).__name__}: {e}") from e
+    if not text:
+        raise UpdateCheckError("update server returned an empty response")
+    return text
 
 
 def check_for_update() -> str | None:
-    """The newer version's commit SHA if an update is available, else None
-    (already up to date, or the check doesn't apply/failed)."""
+    """The newer version's commit SHA if an update is available, None if
+    already current. Raises UpdateCheckError if the check itself failed --
+    callers must not treat that the same as "no update" (see
+    UpdateCheckError's docstring)."""
     local = get_local_version()
     if local is None:
         return None
-    remote = get_remote_version()
-    if remote is None or remote == local:
+    remote = get_remote_version()  # raises UpdateCheckError on failure
+    if remote == local:
         return None
     return remote
 
