@@ -2005,10 +2005,10 @@ class SingleOrderTab(ttk.Frame):
             if self.layout.bg_rotation:
                 # Rotating the background swaps its width/height -- without
                 # also rotating the overlay's own coordinates to match,
-                # merge_pdf()'s scale_to() has to squash it non-uniformly to
-                # fit, visibly stretching the dimension text/lines (the
-                # background itself doesn't stretch since it's rotated as a
-                # proper image, not just scaled).
+                # merge_pdf()'s canonical->real scaling has to squash it
+                # non-uniformly to fit, visibly stretching the dimension
+                # text/lines (the background itself doesn't stretch since
+                # it's rotated as a proper image, not just scaled).
                 items, brackets = engine.rotate_overlay_for_page(
                     ctx["profile"], wide_origin, items, brackets, self.layout.bg_rotation)
         else:
@@ -2020,10 +2020,11 @@ class SingleOrderTab(ttk.Frame):
             bar_offset = (0.0, 0.0)
             page_rotation = 0
         try:
-            overlay_bytes = engine.render_page(ctx["profile"], ctx["material"], items, wide_origin=wide_origin,
-                                                brackets=brackets, bar_offset=bar_offset,
-                                                page_rotation=page_rotation)
-            engine.merge_pdf(order_form_for_merge, ctx["production_order"], overlay_bytes, ctx["out_path"])
+            overlay_bytes, overlay_min_x, overlay_min_y = engine.render_page(
+                ctx["profile"], ctx["material"], items, wide_origin=wide_origin,
+                brackets=brackets, bar_offset=bar_offset, page_rotation=page_rotation)
+            engine.merge_pdf(order_form_for_merge, ctx["production_order"], overlay_bytes, ctx["out_path"],
+                              min_x=overlay_min_x, min_y=overlay_min_y)
         except Exception as e:
             traceback.print_exc()
             messagebox.showerror("Failed", str(e))

@@ -100,7 +100,7 @@ import zipfile
 from pathlib import Path
 
 import pikepdf
-from pypdf import PdfReader, PdfWriter
+from pypdf import PdfReader, PdfWriter, Transformation
 from reportlab.pdfgen import canvas
 from reportlab.pdfbase.pdfmetrics import stringWidth
 from reportlab.lib.colors import Color
@@ -972,7 +972,8 @@ def _rotate_page_point(x: float, y: float, page_rotation: int) -> tuple:
     metadata (get_transformed_order_form()'s docstring explains why that
     distinction matters for the background image; this is the overlay's
     equivalent, used to keep it from getting non-uniformly stretched by
-    merge_pdf()'s scale_to() when the background has been rotated)."""
+    merge_pdf()'s canonical->real scaling when the background has been
+    rotated)."""
     page_rotation = page_rotation % 360
     if page_rotation == 90:
         return PAGE_H - y, x
@@ -1005,8 +1006,8 @@ def rotate_overlay_for_page(profile: dict, wide_origin: bool, items: list, brack
     """Repositions overlay items and bracket(s) to match a background
     that's been rotated by page_rotation degrees (see
     InteractiveLayout._rotate_background() in app.py) -- without this,
-    merge_pdf()'s final scale_to() has to non-uniformly squash the overlay
-    to fit the rotated page's swapped aspect ratio, visibly stretching
+    merge_pdf()'s canonical->real scaling has to non-uniformly squash the
+    overlay to fit the rotated page's swapped aspect ratio, visibly stretching
     dimension text/lines instead of just repositioning them. Text itself is
     repositioned but not rotated (numbers stay upright and readable, same
     as normal drafting convention). A no-op if page_rotation is 0. Scoped
@@ -1104,7 +1105,13 @@ def _content_bbox(profile: dict, material: str, items: list, wide_origin: bool,
 
 
 def render_page(profile: dict, material: str, items: list, wide_origin: bool = False,
-                 brackets: list = None, bar_offset: tuple = (0.0, 0.0), page_rotation: int = 0) -> bytes:
+                 brackets: list = None, bar_offset: tuple = (0.0, 0.0), page_rotation: int = 0) -> tuple:
+    """Returns (pdf_bytes, min_x, min_y). min_x/min_y are the canonical
+    (0,0)-(PAGE_W,PAGE_H)-space coordinates that ended up at this page's own
+    local (0, 0) -- i.e. how far auto-grow (below) shifted everything by.
+    merge_pdf() needs these to correctly place the overlay on the real page
+    (see its docstring for why) -- pass them straight through, don't just
+    take the bytes."""
     # brackets is a list of {"offset": (dx,dy), "rotation": 0/90/180/270} --
     # some orders need more than one CNC/CAD reference point. Defaults to a
     # single un-adjusted bracket at the calibrated position.
@@ -1121,8 +1128,12 @@ def render_page(profile: dict, material: str, items: list, wide_origin: bool = F
     # but a manually dragged bracket/bar/item can end up outside it -- size
     # the overlay's own page to whatever actually needs to fit (never
     # smaller than the normal page) and shift every draw call by the box's
-    # origin, so nothing is ever silently cut off. merge_pdf() then scales
-    # this correctly-sized overlay onto the real target page as usual.
+    # origin, so nothing is ever silently cut off. merge_pdf() then places
+    # this correctly-sized overlay onto the real target page using min_x/
+    # min_y (returned below) plus the fixed canonical->real scale ratio --
+    # NOT a scale derived from this page's own (possibly grown) size, which
+    # would silently shrink/shift everything else on the page too (the bug
+    # this whole tuple return exists to fix).
     min_x, min_y, max_x, max_y = _content_bbox(profile, material, items, wide_origin, brackets, bar_offset,
                                                 page_rotation)
     off_x, off_y = -min_x, -min_y
@@ -1206,18 +1217,24 @@ def render_page(profile: dict, material: str, items: list, wide_origin: bool = F
 
     c.save()
     buf.seek(0)
-    return buf.read()
+    return buf.read(), min_x, min_y
 
 
 def build_overlay(profile: dict, oversize_w: float, oversize_h: float, material: str,
-                   thickness: str = "", wide_origin: bool = False) -> bytes:
-    """Back-compat wrapper: renders the default (non-edited) item layout."""
+                   thickness: str = "", wide_origin: bool = False) -> tuple:
+    """Back-compat wrapper: renders the default (non-edited) item layout.
+    Returns (pdf_bytes, min_x, min_y) -- see render_page()."""
     items = compute_default_items(profile, oversize_w, oversize_h, thickness=thickness)
     return render_page(profile, material, items, wide_origin=wide_origin)
 
 
 def merge_pdf(order_form_pdf: str, production_order_pdf: str, overlay_bytes: bytes,
-              out_path: str, rotate_deg: int = 90):
+              out_path: str, rotate_deg: int = 90, min_x: float = 0.0, min_y: float = 0.0):
+    """min_x/min_y: the canonical-space origin render_page() returned
+    alongside overlay_bytes (0, 0 unless the overlay auto-grew past the
+    normal page bounds -- see render_page()'s docstring). Required to place
+    the overlay correctly; a caller passing pre-rendered bytes without them
+    will misplace anything on a page that auto-grew."""
     order_form_pdf = ensure_pdf(order_form_pdf)  # converts image scans (jpg/png/etc.) to PDF
     overlay_reader = PdfReader(io.BytesIO(overlay_bytes))
     order_reader = PdfReader(order_form_pdf)
@@ -1227,16 +1244,22 @@ def merge_pdf(order_form_pdf: str, production_order_pdf: str, overlay_bytes: byt
     page0 = order_reader.pages[0]
     overlay_page = overlay_reader.pages[0]
     real_w, real_h = _effective_page_size(page0)
-    if abs(real_w - PAGE_W) > 0.5 or abs(real_h - PAGE_H) > 0.5:
-        # The overlay is always rendered on a fixed Letter-size canvas
-        # (PAGE_W x PAGE_H) to match the PROFILES calibration, but not every
-        # customer order-form PDF is actually Letter-sized (e.g. scanned/
-        # saved as A4 by whatever tool produced it). pypdf's merge_page()
-        # does no scaling of its own -- without this, the overlay's
-        # coordinates get stamped onto a differently-sized page unscaled,
-        # landing every dragged/calibrated position in the wrong spot even
-        # though the drag itself was recorded correctly.
-        overlay_page.scale_to(real_w, real_h)
+    # Always scale by the FIXED canonical (PAGE_W, PAGE_H) -> real-page
+    # ratio -- the same ratio the live editor's drag math always assumes
+    # (see InteractiveLayout._pdf_to_canvas/_canvas_to_pdf_delta in app.py)
+    # -- never by a ratio derived from the overlay's own current page size.
+    # That distinction matters whenever the overlay auto-grew past the
+    # normal bounds (render_page()'s "never clip" behavior, e.g. from a
+    # bunch of dragged notes): scale_to(real_w, real_h) would derive its
+    # ratio from the GROWN size instead of PAGE_W x PAGE_H, silently
+    # shrinking/shifting every item on the page relative to where the live
+    # preview showed it -- not just the one that triggered the growth.
+    # min_x/min_y (also from render_page(), 0 unless auto-grow shifted
+    # things) correct for that shift with a translate, composed after the
+    # same fixed scale.
+    sx, sy = real_w / PAGE_W, real_h / PAGE_H
+    transform = Transformation().scale(sx, sy).translate(min_x * sx, min_y * sy)
+    overlay_page.add_transformation(transform, expand=True)
     page0.merge_page(overlay_page)
     writer.add_page(page0)
 
@@ -1271,9 +1294,10 @@ def build_output(order_form_pdf: str, production_order_pdf: str, material: str,
     thickness = (thickness or "").strip()
     thickness_unsupported = bool(thickness) and "thickness_text_pos" not in profile
 
-    overlay_bytes = build_overlay(profile, oversize_w, oversize_h, material,
-                                   thickness=thickness, wide_origin=wide_origin)
-    merge_pdf(order_form_pdf, production_order_pdf, overlay_bytes, out_path, rotate_deg=rotate_deg)
+    overlay_bytes, min_x, min_y = build_overlay(profile, oversize_w, oversize_h, material,
+                                                 thickness=thickness, wide_origin=wide_origin)
+    merge_pdf(order_form_pdf, production_order_pdf, overlay_bytes, out_path, rotate_deg=rotate_deg,
+              min_x=min_x, min_y=min_y)
 
     return {
         **meta,
