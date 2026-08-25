@@ -1327,12 +1327,18 @@ def merge_pdf(order_form_pdf: str, production_order_pdf: str, overlay_bytes: byt
     alongside overlay_bytes (0, 0 unless the overlay auto-grew past the
     normal page bounds -- see render_page()'s docstring). Required to place
     the overlay correctly; a caller passing pre-rendered bytes without them
-    will misplace anything on a page that auto-grew."""
-    # Always normalized to a portrait PAGE_W x PAGE_H page first (idempotent
-    # if the caller -- e.g. app.py's generate() -- already did this itself
-    # with a specific manual rotation/scale on top; harmless/no-op if
-    # order_form_pdf is already such a page).
-    order_form_pdf = get_transformed_order_form(order_form_pdf)
+    will misplace anything on a page that auto-grew.
+
+    order_form_pdf must already be fully transformed (normalize_to_portrait_
+    page()/get_transformed_order_form(), with any manual rotation/scale the
+    caller wants already applied) -- NOT re-normalized here. Re-running
+    normalization on an already-rotated page isn't a no-op: a manually-
+    rotated (now landscape-shaped) page would get letterbox-fit into
+    portrait *again*, silently re-shrinking/repositioning it in a way the
+    overlay's already-computed positions (rotate_overlay_for_page()) never
+    accounted for -- exactly what caused a real reported bug (bracket
+    missing, measurements shifted, after using the manual rotate control)."""
+    order_form_pdf = ensure_pdf(order_form_pdf)  # converts image scans (jpg/png/etc.) to PDF; no-op if already a PDF
     overlay_reader = PdfReader(io.BytesIO(overlay_bytes))
     order_reader = PdfReader(order_form_pdf)
     prod_reader = PdfReader(production_order_pdf)
@@ -1393,7 +1399,11 @@ def build_output(order_form_pdf: str, production_order_pdf: str, material: str,
 
     overlay_bytes, min_x, min_y = build_overlay(profile, oversize_w, oversize_h, material,
                                                  thickness=thickness, wide_origin=wide_origin)
-    merge_pdf(order_form_pdf, production_order_pdf, overlay_bytes, out_path, rotate_deg=rotate_deg,
+    # merge_pdf() expects an already-fully-transformed page (see its
+    # docstring) -- the CLI has no live editor/manual rotation to apply, so
+    # this is just the plain portrait-normalized baseline.
+    normalized_order_form = get_transformed_order_form(order_form_pdf)
+    merge_pdf(normalized_order_form, production_order_pdf, overlay_bytes, out_path, rotate_deg=rotate_deg,
               min_x=min_x, min_y=min_y)
 
     return {
