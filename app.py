@@ -354,6 +354,25 @@ class InteractiveLayout(ttk.Frame):
         for item in self.items:
             self._draw_item(item)
         self._draw_static_bar_and_bracket()
+        self._sync_scrollregion_to_content()
+
+    def _sync_scrollregion_to_content(self):
+        """Extends the canvas's scrollable area to include anything dragged
+        outside the background image's own bounds (e.g. a dimension label
+        moved near/past the edge) -- export already never clips this (see
+        render_page()'s auto-grow), but without this the preview's own
+        scrollregion stayed fixed to just the background image, so a
+        dragged-out item could still LOOK cut off there even though it
+        wasn't actually missing from the generated PDF."""
+        content_bbox = self.canvas.bbox("all")
+        if content_bbox is None:
+            return
+        bg_w, bg_h = self.bg_photo.width(), self.bg_photo.height()
+        min_x = min(0, content_bbox[0])
+        min_y = min(0, content_bbox[1])
+        max_x = max(bg_w, content_bbox[2])
+        max_y = max(bg_h, content_bbox[3])
+        self.canvas.config(scrollregion=(min_x, min_y, max_x, max_y))
 
     # -- rotating/resizing the customer drawing itself (not an overlay item,
     #    the background scan) -- useful for a simple drawing scanned
@@ -851,6 +870,7 @@ class InteractiveLayout(ttk.Frame):
 
     def _release(self):
         self.drag_key = None
+        self._sync_scrollregion_to_content()
 
     # -- cut-line endpoint handles (extend/shorten the line, as opposed to
     #    _press/_motion/_release above which move the whole line) ----------
@@ -888,6 +908,7 @@ class InteractiveLayout(ttk.Frame):
 
     def _cutline_endpoint_release(self, event=None):
         self._endpoint_drag = None
+        self._sync_scrollregion_to_content()
 
     # -- origin bracket (draggable, since calibration can be off for a given
     #    product/order and there's no other way to correct it; more than one
@@ -928,6 +949,7 @@ class InteractiveLayout(ttk.Frame):
 
     def _bracket_release(self, event=None):
         self._dragging_bracket = None
+        self._sync_scrollregion_to_content()
 
     def _bracket_context_menu(self, event, index):
         bracket = self.brackets[index]
@@ -1016,6 +1038,7 @@ class InteractiveLayout(ttk.Frame):
 
     def _bar_release(self, event=None):
         self._bar_dragging = False
+        self._sync_scrollregion_to_content()
 
     def _bar_context_menu(self, event):
         menu = tk.Menu(self, tearoff=0)
