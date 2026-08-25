@@ -1272,6 +1272,11 @@ class SingleOrderTab(ttk.Frame):
         # idea as the Drain A field already having a manual fallback.
         self.raw_width = tk.StringVar(value="")
         self.raw_height = tk.StringVar(value="")
+        # Applied in _resolve_production_meta() so it corrects EVERYTHING
+        # downstream (oversize calc, wide-panel bracket check, the drawing
+        # itself) regardless of whether the mixed-up values came from the
+        # parse or were typed into the override fields above.
+        self.swap_width_height = tk.BooleanVar(value=False)
         self.product_type_override = tk.StringVar(value="")
         self.out_dir = tk.StringVar(value=engine.get_default_output_dir() or str(Path.home() / "Desktop"))
         self.out_name = tk.StringVar(value="")
@@ -1408,6 +1413,12 @@ class SingleOrderTab(ttk.Frame):
             row=row, column=1, columnspan=2, sticky="w"
         )
         row += 1
+        ttk.Checkbutton(
+            left, text="Swap width/height", variable=self.swap_width_height,
+        ).grid(row=row, column=0, sticky="w", pady=(2, 0))
+        ttk.Label(left, text="In case the production order (or a manual entry above) has them switched.",
+                  foreground="#777").grid(row=row, column=1, columnspan=2, sticky="w", pady=(2, 0))
+        row += 1
 
         ttk.Label(left, text="Product type override", font=("", 11, "bold")).grid(
             row=row, column=0, columnspan=3, sticky="w", pady=(6, 4)
@@ -1535,7 +1546,8 @@ class SingleOrderTab(ttk.Frame):
         # auto-refresh the live preview whenever any relevant field changes
         for var in (self.order_form_path, self.production_order_path, self.material,
                     self.thickness, self.drain_a, self.curb_depth, self.curb_affects_width,
-                    self.keyhole_linear, self.raw_width, self.raw_height, self.product_type_override):
+                    self.keyhole_linear, self.swap_width_height,
+                    self.raw_width, self.raw_height, self.product_type_override):
             var.trace_add("write", lambda *_: self._schedule_preview_update())
         self._schedule_preview_update()
 
@@ -1768,6 +1780,9 @@ class SingleOrderTab(ttk.Frame):
                 return None, None, f"Could not read the production order file: {parse_error}"
             return None, None, "Fill in the Raw width/height and Product type overrides below, or choose a readable production order PDF."
 
+        if self.swap_width_height.get():
+            raw_width_in, raw_height_in = raw_height_in, raw_width_in
+
         meta = {
             "po_number": parsed["po_number"] if parsed else None,
             "so_number": parsed["so_number"] if parsed else None,
@@ -1946,6 +1961,7 @@ class SingleOrderTab(ttk.Frame):
         self.curb_depth.set(entry.get("curb_depth", ""))
         self.curb_affects_width.set(entry.get("curb_affects_width", False))
         self.keyhole_linear.set(entry.get("keyhole_linear", False))
+        self.swap_width_height.set(entry.get("swap_width_height", False))
         self.raw_width.set(entry.get("raw_width", ""))
         self.raw_height.set(entry.get("raw_height", ""))
         self.product_type_override.set(entry.get("product_type_override", ""))
@@ -1978,6 +1994,7 @@ class SingleOrderTab(ttk.Frame):
         self.curb_depth.set("")
         self.curb_affects_width.set(False)
         self.keyhole_linear.set(False)
+        self.swap_width_height.set(False)
         self.out_name.set("")
         self._last_auto_thickness = None
         self._autoread_attempted_for = None
@@ -2090,6 +2107,7 @@ class SingleOrderTab(ttk.Frame):
                 "curb_depth": self.curb_depth.get().strip(),
                 "curb_affects_width": self.curb_affects_width.get(),
                 "keyhole_linear": self.keyhole_linear.get(),
+                "swap_width_height": self.swap_width_height.get(),
                 "raw_width": self.raw_width.get().strip(),
                 "raw_height": self.raw_height.get().strip(),
                 "product_type_override": self.product_type_override.get().strip(),
