@@ -217,7 +217,7 @@ wide-panel rule was closed out.
   before (e.g. still said the bracket was "deliberately not draggable" after this session's changes
   — since corrected) and is the only reference the user actually reads day to day.
 
-## 8. Distribution plan — real app icon on 3 computers, self-updating (IN PROGRESS, decisions pending)
+## 8. Distribution plan — real app icon on 3 computers, self-updating (SHIPPED — see below)
 
 **Goal (user's words):** "anyone with the icon can click it and get to work," updates made on the
 Mac "push to anyone who has that (mine or theirs)." Three target machines: the user's Mac (where
@@ -228,65 +228,51 @@ but **cannot log into Claude on**. Confirmed fine: once the app is a real packag
 app file. The "needs to log into Claude/GitHub" requirement only applies to the machines doing the
 actual building/updating (the Mac, mainly).
 
-### Where this stands right now
+### Where this stands right now (updated 2026-08-27)
 
-- **GitHub repo already created by the user:** `kbrs-dev/K-COFs-app` (currently private).
-- **Files are fully prepped and current** at `Documents/KBRS Markup App/`: `app.py`,
-  `kbrs_markup.py` (both confirmed to include the origin-bracket drag/rotate work, compiled clean),
-  `.gitignore`, `KBRS Markup.command` (Mac) and `KBRS Markup.bat` (Windows) — **both launchers
-  already do a non-blocking `git pull --ff-only` before launching**, README (now covers Windows
-  setup + the multi-computer GitHub Desktop workflow), and this handoff doc.
-- **Known environment limitation:** Claude's sandbox cannot run git operations (`git init`,
-  `git commit`, etc.) inside the user's connected/mounted folders — file deletion/temp-file cleanup
-  is blocked at the mount level, which breaks git's internals. **The actual repo creation/first
-  push has to happen via GitHub Desktop on the user's real Mac**, not via Claude's shell — the
-  prepared files above are ready to be dragged into a freshly-cloned copy of `K-COFs-app` and
-  committed/pushed from there. This was not yet done as of this session — still a manual step for
-  the user (or the next Claude session) to walk through.
+Both open decisions below were resolved and fully built out in the sessions after this was
+originally written — the repo is public, the Windows build is automated via GitHub Actions, and
+the app self-updates. This section is kept for history; see the Session log for what actually
+shipped and when.
 
-### Open decision 1 — public vs. private repo
+- **`kbrs-dev/K-COFs-app` is public** (confirmed via the GitHub API: `"private": false`,
+  `"visibility": "public"`). Resolves open decision 1 below in the recommended direction — anyone/
+  anything can pull or download a release with zero login; only push access is restricted.
+- **Tier 3 (full self-updating packaged app) shipped**, resolving open decision 2 below straight to
+  the top tier rather than stopping at tier 2:
+  - `.github/workflows/build-windows.yml` builds a Windows `.exe` via PyInstaller
+    (`kbrs_markup_windows.spec`) on every push to `main` that touches `app.py`/`kbrs_markup.py`/the
+    spec/the workflow itself, stamps the build with the commit SHA (`version.txt`), zips it, and
+    publishes it to a single rolling GitHub Release (`windows-latest-build`) — one stable download
+    link for both Windows machines instead of a new URL per release.
+  - `app.py` has its own update-check/self-update logic (`get_local_version()`/
+    `get_remote_version()`, a "Check for Updates" File-menu item and an in-app banner) that compares
+    the local `version.txt` against the release's, matching the "click the icon, always get the
+    latest" goal from the original ask.
+  - Real Windows bugs found in actual use were subsequently fixed (see Session log,
+    2026-08-11-ish commit "Fix Windows bugs found in real testing, add self-updater" and the later
+    "Fix update checker silently claiming 'up to date' on a failed check").
+- Mac side: `KBRS Markup.command` still does the `git pull --ff-only` + auto-install flow described
+  originally; no separate Mac `.app`/PyInstaller packaging was pursued since git-pull-and-run
+  already satisfies the Mac use case (that's where updates are authored).
 
-Directly relevant to the 3rd-device requirement: a **private** repo means every machine that pulls
-from it needs an authenticated, invited GitHub account — which conflicts with both "don't want
-other people to have repo access" and "3rd device with no login at all." A **public** repo (this
-one specifically — not the separate, still-private configurator repo) removes that requirement
-entirely: anyone/anything can pull or download a release with zero login, while only the user's own
-Mac needs authenticated push access via GitHub Desktop to publish updates. This app's code has no
-pricing or other business-sensitive data in it (just PDF markup/layout logic), so the exposure from
-going public is low. **Recommended, not yet confirmed by the user.**
+### Open decision 1 — public vs. private repo — RESOLVED: public
 
-### Open decision 2 — how far to package it (three tiers, explained to the user, not yet chosen)
+See above — confirmed public on GitHub, matching the recommendation in this section's original
+text (low exposure, no pricing/business-sensitive data in this repo).
 
-1. **Current state (done):** folder of files + a launcher script. Requires Python installed on
-   every machine; not a real "app icon" experience.
-2. **Real packaged app, manual updates:** bundle everything (Python interpreter included) into a
-   single `.exe` (Windows) / `.app` (Mac) via PyInstaller (free), with a custom icon — genuinely
-   just double-click and go, no installs needed on any machine. Limitation: the Windows build has
-   to happen on an actual Windows machine or a CI service — **cannot be cross-built from this
-   Mac-oriented sandbox**. Updates would still need manual re-download/reinstall per release at
-   this tier.
-3. **Full self-updating app (matches what the user described):** same packaged `.exe`/`.app`, plus
-   a small update-check baked into the app itself — on launch, it checks whether the user has
-   published something newer and silently updates itself first. To build both platform executables
-   automatically on every push (without needing a Windows machine by hand each time), this uses
-   **GitHub Actions** (free CI for public repos). Depends on open decision 1 being resolved to
-   "public," since the auto-update check needs to reach the repo/releases without per-machine
-   logins.
+### Open decision 2 — how far to package it — RESOLVED: tier 3 (full self-update), Windows only
 
-**Not yet decided:** whether to build tier 2 first and add tier 3 auto-update later once packaging
-is proven, or go straight for the full tier 3 build. Recommendation offered to the user (not yet
-confirmed): make the repo public, then build tier 2 first, then layer tier 3 on top.
+Windows got the full tier-3 treatment (packaged `.exe` + GitHub Actions build + in-app
+update-check/self-update). Tier 2/3 packaging was **not** built for Mac — the Mac stays on the
+git-pull-and-run launcher, which was judged sufficient since that's the machine where updates are
+authored anyway, not just consumed.
 
-### Immediate next steps for a new session
+### Remaining open item from this section
 
-1. Confirm the public/private decision and the tier-2-first-vs-tier-3-straightaway decision with
-   the user (both were explained but not yet answered as of this handoff).
-2. Walk the user through the GitHub Desktop clone → drag files in → commit → push flow described
-   above, since Claude's sandbox can't do this step itself.
-3. If proceeding to packaging: set up PyInstaller (Mac build can happen in a session sandbox or on
-   the user's Mac; Windows build needs GitHub Actions or an actual Windows machine), design/obtain
-   an app icon (ask the user if they have a KBRS logo/icon asset, or offer to generate a simple
-   one), and add the self-update check to `app.py` if going for tier 3.
+No packaging/distribution work is outstanding. The one thing never done: a **custom KBRS app
+icon** for the Windows `.exe` was mentioned as a nice-to-have in the original ask ("real app icon")
+but never followed up on — `kbrs_markup_windows.spec` should be checked if that's still wanted.
 
 ---
 
@@ -316,3 +302,32 @@ public-vs-private repo tradeoff (private conflicts with the "3rd device, no logi
 to the user; neither decision was confirmed before the user paused to export this session into a
 new Claude for Work account. See §8 above for full detail — that's the next session's starting
 point.
+
+**Between 2026-07-27 and 2026-08-25 (this repo's actual commit history — not previously logged
+here):** the repo was created on GitHub as **public**, resolving open decision 1. Distribution went
+straight to tier 3 for Windows: PyInstaller packaging (`kbrs_markup_windows.spec`), a GitHub
+Actions workflow that builds and publishes a rolling Windows release on every push to `main`, and
+in-app update-check/self-update logic in `app.py`. Real Windows bugs surfaced in actual use were
+fixed, including a case where the update checker silently reported "up to date" on a failed check
+instead of surfacing the failure. Also shipped since: Blue Traveler material auto-fills 1.5"
+thickness + a "FLANGE ON ALL SIDES" note; a 45° bracket rotation step for neo-angle showers;
+PDF flattening of fillable/annotated order forms on import; a File > Recent Orders list (last 15);
+a "Swap width/height" checkbox; a "Keyhole Linear" checkbox adding a "DRAIN PLATE NEEDED" note;
+portrait-normalization fixes for scanned order forms (page-1 export is now always exact portrait
+Letter, without force-rotating landscape scans); a fix for notes/items mispositioning when the
+overlay auto-grows; a fix for the bracket/measurements breaking after a manual "Rotate drawing";
+and a fix for the live preview appearing to (but not actually) clip items dragged near the page
+edge. See `.github/workflows/build-windows.yml` and `git log` for full detail.
+
+**2026-08-27:** Picked this back up after a gap — working tree was clean, nothing pending. Found
+this handoff doc badly stale: it still described the distribution plan (§8) as "in progress" with
+two unresolved decisions, but the actual commit history showed both had been resolved and fully
+built (public repo, confirmed via the GitHub API; tier-3 self-updating Windows app, confirmed via
+`build-windows.yml` and the release pipeline). Rewrote §8 to match reality instead of leaving a
+misleading "still open" section for the next session to re-litigate. The one item from this whole
+doc that's still genuinely unresolved is §5 (CLTB origin bracket calibration for drain-right
+orders) — checked `PROFILES["CLTB"]["bracket"]` in `kbrs_markup.py` and it's still the original
+top-left coordinate, unchanged since 2026-07-24. That one can't be closed out without a real
+confirmed bottom-left CLTB example from the user (a finished drag+rotate result or PDF), same
+constraint as before — flagged back to the user rather than guessing at a safety-critical CNC
+coordinate.
