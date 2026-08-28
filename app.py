@@ -225,7 +225,7 @@ class InteractiveLayout(ttk.Frame):
         self.undo_stack = []
         self.redo_stack = []
         self.drag_key = None
-        self._endpoint_drag = None  # which cut-line endpoint (0/1) is being dragged, if any
+        self._endpoint_drag = None  # (key, which) of the line endpoint being dragged, if any
         self.bg_photo = None
         # A list, not a single bracket -- some orders need more than one
         # CNC/CAD reference point. Each entry: {"offset": (dx,dy) PDF points
@@ -498,18 +498,25 @@ class InteractiveLayout(ttk.Frame):
         pdf.close()
         return pil_img, real_page_w, real_page_h
 
-    def load_background_only(self, order_form_path, production_order_path=None):
+    def load_background_only(self, order_form_path, production_order_path=None, material="", restore_state=None):
         """Order form picked, but no calibrated profile yet -- either the
         production order hasn't been read, or it parsed fine but the product
         line itself has no PROFILES entry (e.g. a genuinely new product like
         a Vanity Vessel, whose production order also doesn't even follow the
-        usual SKU/dimension text format). Shows just the background with no
-        automatic items -- but Add note / Add cut-for-shipping line still
-        work (see has_background), since neither needs a calibrated
-        position. Only the profile-driven material bar and origin bracket
-        are unavailable here."""
-        self.bg_rotation = 0
-        self.bg_scale = 1.0
+        usual SKU/dimension text format). Shows the background plus the
+        material bar (default position -- see engine.DEFAULT_MATERIAL_BAR);
+        Add note / Add cut-for-shipping line / Add diagonal line also work
+        (see has_background), since none of those need a calibrated
+        position either. Only the origin bracket and dimension callouts,
+        which do need real calibration, are unavailable here.
+
+        restore_state (from SingleOrderTab.open_recent_order()) puts back a
+        previously saved manual-only markup -- same "quick single-field
+        re-edit" flow load_new_order() gives profile-based orders, since
+        without this every reopen from Recent Orders would silently drop all
+        the manually-added notes/lines and start from a blank order form."""
+        self.bg_rotation = restore_state["bg_rotation"] if restore_state else 0
+        self.bg_scale = restore_state["bg_scale"] if restore_state else 1.0
         try:
             pil_img, real_page_w, real_page_h = self._render_background(order_form_path)
         except Exception as e:
@@ -522,12 +529,25 @@ class InteractiveLayout(ttk.Frame):
         self.order_form_path = order_form_path
         self.production_order_path = production_order_path
         self.profile = None
+        self.material = material
         self.real_page_w, self.real_page_h = real_page_w, real_page_h
-        self.items = []
+        self.bracket_canvas_ids = {}
+        self.undo_stack = []
+        self.redo_stack = []
+        if restore_state:
+            self.has_cut_line = restore_state["has_cut_line"]
+            self.bar_offset = restore_state["bar_offset"]
+            self.items = copy.deepcopy(restore_state["items"])
+        else:
+            self.has_cut_line = False
+            self.bar_offset = (0.0, 0.0)
+            self.items = []
         self.bg_photo = ImageTk.PhotoImage(pil_img)
         self.preview_page = 1
         self._show_canvas_ui()
         self._draw_page1()
+        self.cut_btn.config(text="Remove cut-for-shipping line" if self.has_cut_line else "Add cut-for-shipping line")
+        self._update_undo_redo_buttons()
         return True
 
     def load_new_order(self, order_form_path, production_order_path, profile, material,
@@ -648,6 +668,19 @@ class InteractiveLayout(ttk.Frame):
         if self._dragging_bracket is None and not self._bar_dragging:
             self._draw_static_bar_and_bracket()
 
+    def sync_material(self, material):
+        """Lightweight counterpart to sync() for background-only (no
+        calibrated profile) mode: just re-draws the material bar with the
+        current Traveler text. sync() itself requires self.loaded (which
+        this mode never sets, by design -- see load_background_only()), so
+        without this the bar would keep showing whatever material was typed
+        at the moment the order form was first loaded."""
+        if self.material == material:
+            return
+        self.material = material
+        if self._dragging_bracket is None and not self._bar_dragging:
+            self._draw_static_bar_and_bracket()
+
     def _sync_flange_note(self, material):
         """Blue Traveler orders standardly need a 'FLANGE ON ALL SIDES' note
         -- auto-add one when that material is selected/detected, same on/off-
@@ -696,15 +729,19 @@ class InteractiveLayout(ttk.Frame):
         for cid in self.bracket_canvas_ids.values():
             self.canvas.delete(cid)
         self.bracket_canvas_ids = {}
-        if not self.profile:
-            return
+        # The material bar always draws, even without a calibrated profile
+        # (falls back to engine.DEFAULT_MATERIAL_BAR -- see
+        # render_page()/_material_bar_rect() for why: the Traveler name
+        # isn't a CNC-critical measurement, so a draggable default is worth
+        # having). The origin bracket below stays profile-only -- there's no
+        # safe default for a safety-critical CNC reference point.
         profile = self.profile
         bar_color = engine.resolve_bar_color(self.material)
         text_color = engine.resolve_text_color(bar_color)
-        bx0, by0, bx1, by1 = profile["material_bar"]
+        bx0, by0, bx1, by1 = profile["material_bar"] if profile else engine.DEFAULT_MATERIAL_BAR
         bdx, bdy = self.bar_offset
         bx0, by0, bx1, by1 = bx0 + bdx, by0 + bdy, bx1 + bdx, by1 + bdy
-        fsize_material = profile["font_size_material"]
+        fsize_material = profile["font_size_material"] if profile else engine.DEFAULT_FONT_SIZE_MATERIAL
         fsize_px = max(8, int(fsize_material * CANVAS_SCALE))
         label_text = (self.material or "").upper()
         # Size the bar to fit the actual text (measured with the real font
@@ -723,7 +760,7 @@ class InteractiveLayout(ttk.Frame):
             cx0, cy0, cx1, cy1, fill=_color_to_hex(bar_color), outline="#d81b60" if bar_manually_adjusted else "",
             width=2 if bar_manually_adjusted else 0,
         )
-        mx, _my = profile["material_text_pos"]
+        mx = profile["material_text_pos"][0] if profile else engine.DEFAULT_MATERIAL_TEXT_X
         mx += bdx
         baseline_y_pdf = (by0 + by1) / 2 - fsize_material * 0.35
         tcx, tcy = self._pdf_to_canvas(mx, baseline_y_pdf)
@@ -743,29 +780,32 @@ class InteractiveLayout(ttk.Frame):
         # given order/product, and there's no other way to correct it. Not
         # just one either: some orders need more than one CNC/CAD reference
         # point, so this loops over self.brackets (always at least one).
-        base_pts = profile["bracket_wide"] if (self.wide_origin and "bracket_wide" in profile) else profile["bracket"]
-        for i, bracket in enumerate(self.brackets):
-            dx_off, dy_off = bracket["offset"]
-            rotation = bracket["rotation"]
-            pdf_pts = [(px + dx_off, py + dy_off) for px, py in base_pts]
-            if rotation:
-                pivot = pdf_pts[1]  # the elbow -- the actual corner vertex the bracket marks
-                pdf_pts = [engine.rotate_point(pt, pivot, rotation) for pt in pdf_pts]
-            flat_pts = []
-            for px, py in pdf_pts:
-                cx, cy = self._pdf_to_canvas(px, py)
-                flat_pts.extend([cx, cy])
-            manually_adjusted = bracket["offset"] != (0.0, 0.0) or rotation != 0
-            bracket_color = "#d81b60" if manually_adjusted else ITEM_COLOR_HEX["orange"]  # flag a manual nudge/rotation
-            cid = self.canvas.create_line(
-                *flat_pts, fill=bracket_color, width=max(2, int(profile["bracket_width"] * CANVAS_SCALE))
-            )
-            self.bracket_canvas_ids[i] = cid
-            self.canvas.tag_bind(cid, "<ButtonPress-1>", lambda e, idx=i: self._bracket_press(e, idx))
-            self.canvas.tag_bind(cid, "<B1-Motion>", lambda e, idx=i: self._bracket_motion(e, idx))
-            self.canvas.tag_bind(cid, "<ButtonRelease-1>", lambda e: self._bracket_release())
-            self.canvas.tag_bind(cid, "<Button-2>", lambda e, idx=i: self._bracket_context_menu(e, idx))
-            self.canvas.tag_bind(cid, "<Button-3>", lambda e, idx=i: self._bracket_context_menu(e, idx))
+        # Skipped entirely without a profile -- unlike the bar above, there's
+        # no safe default for a safety-critical CNC reference point.
+        if profile:
+            base_pts = profile["bracket_wide"] if (self.wide_origin and "bracket_wide" in profile) else profile["bracket"]
+            for i, bracket in enumerate(self.brackets):
+                dx_off, dy_off = bracket["offset"]
+                rotation = bracket["rotation"]
+                pdf_pts = [(px + dx_off, py + dy_off) for px, py in base_pts]
+                if rotation:
+                    pivot = pdf_pts[1]  # the elbow -- the actual corner vertex the bracket marks
+                    pdf_pts = [engine.rotate_point(pt, pivot, rotation) for pt in pdf_pts]
+                flat_pts = []
+                for px, py in pdf_pts:
+                    cx, cy = self._pdf_to_canvas(px, py)
+                    flat_pts.extend([cx, cy])
+                manually_adjusted = bracket["offset"] != (0.0, 0.0) or rotation != 0
+                bracket_color = "#d81b60" if manually_adjusted else ITEM_COLOR_HEX["orange"]  # flag a manual nudge/rotation
+                cid = self.canvas.create_line(
+                    *flat_pts, fill=bracket_color, width=max(2, int(profile["bracket_width"] * CANVAS_SCALE))
+                )
+                self.bracket_canvas_ids[i] = cid
+                self.canvas.tag_bind(cid, "<ButtonPress-1>", lambda e, idx=i: self._bracket_press(e, idx))
+                self.canvas.tag_bind(cid, "<B1-Motion>", lambda e, idx=i: self._bracket_motion(e, idx))
+                self.canvas.tag_bind(cid, "<ButtonRelease-1>", lambda e: self._bracket_release())
+                self.canvas.tag_bind(cid, "<Button-2>", lambda e, idx=i: self._bracket_context_menu(e, idx))
+                self.canvas.tag_bind(cid, "<Button-3>", lambda e, idx=i: self._bracket_context_menu(e, idx))
         for other_cid in self.canvas_ids.values():
             self.canvas.tag_raise(other_cid)  # keep draggable items above the bar/bracket
 
@@ -793,18 +833,20 @@ class InteractiveLayout(ttk.Frame):
                 width=4, dash=(6, 4) if item.get("dashed") else None,
             )
             targets = (cid,)
-            if key == "cut_line":
+            if item.get("endpoint_handles"):
                 # small draggable handles at each end so the line can be
-                # extended/shortened, not just moved as a whole
+                # extended/shortened, not just moved as a whole -- generic
+                # across any line-kind item that opts in (cut_line and the
+                # manual diagonal line both do), not just cut_line.
                 r = 5
                 h0 = self.canvas.create_oval(cx0 - r, cy0 - r, cx0 + r, cy0 + r, fill=color_hex, outline="")
                 h1 = self.canvas.create_oval(cx1 - r, cy1 - r, cx1 + r, cy1 + r, fill=color_hex, outline="")
-                self.canvas.tag_bind(h0, "<ButtonPress-1>", lambda e: self._cutline_endpoint_press(e, 0))
-                self.canvas.tag_bind(h0, "<B1-Motion>", lambda e: self._cutline_endpoint_motion(e, 0))
-                self.canvas.tag_bind(h0, "<ButtonRelease-1>", lambda e: self._cutline_endpoint_release())
-                self.canvas.tag_bind(h1, "<ButtonPress-1>", lambda e: self._cutline_endpoint_press(e, 1))
-                self.canvas.tag_bind(h1, "<B1-Motion>", lambda e: self._cutline_endpoint_motion(e, 1))
-                self.canvas.tag_bind(h1, "<ButtonRelease-1>", lambda e: self._cutline_endpoint_release())
+                self.canvas.tag_bind(h0, "<ButtonPress-1>", lambda e, k=key: self._line_endpoint_press(e, k, 0))
+                self.canvas.tag_bind(h0, "<B1-Motion>", lambda e, k=key: self._line_endpoint_motion(e, k, 0))
+                self.canvas.tag_bind(h0, "<ButtonRelease-1>", lambda e: self._line_endpoint_release())
+                self.canvas.tag_bind(h1, "<ButtonPress-1>", lambda e, k=key: self._line_endpoint_press(e, k, 1))
+                self.canvas.tag_bind(h1, "<B1-Motion>", lambda e, k=key: self._line_endpoint_motion(e, k, 1))
+                self.canvas.tag_bind(h1, "<ButtonRelease-1>", lambda e: self._line_endpoint_release())
                 self.line_handle_ids[key] = (h0, h1)
         else:
             cx, cy = self._pdf_to_canvas(item["x"], item["y"])
@@ -891,16 +933,18 @@ class InteractiveLayout(ttk.Frame):
         self.drag_key = None
         self._sync_scrollregion_to_content()
 
-    # -- cut-line endpoint handles (extend/shorten the line, as opposed to
-    #    _press/_motion/_release above which move the whole line) ----------
-    def _cutline_endpoint_press(self, event, which):
+    # -- line endpoint handles (extend/shorten a line, as opposed to
+    #    _press/_motion/_release above which move the whole line) -- generic
+    #    across any line-kind item with "endpoint_handles": True (cut_line
+    #    and the manual diagonal line both do) -------------------------------
+    def _line_endpoint_press(self, event, key, which):
         self.canvas.focus_set()
-        self._endpoint_drag = which
+        self._endpoint_drag = (key, which)
         self._last_xy = (event.x, event.y)
         self._drag_snapshotted = False
 
-    def _cutline_endpoint_motion(self, event, which):
-        if self._endpoint_drag != which:
+    def _line_endpoint_motion(self, event, key, which):
+        if self._endpoint_drag != (key, which):
             return
         if not self._drag_snapshotted:
             self._push_undo()
@@ -908,7 +952,7 @@ class InteractiveLayout(ttk.Frame):
         dx_px = event.x - self._last_xy[0]
         dy_px = event.y - self._last_xy[1]
         self._last_xy = (event.x, event.y)
-        item = self._item("cut_line")
+        item = self._item(key)
         dx_pdf, dy_pdf = self._canvas_to_pdf_delta(dx_px, dy_px)
         xkey, ykey = ("x0", "y0") if which == 0 else ("x1", "y1")
         item[xkey] += dx_pdf
@@ -916,16 +960,16 @@ class InteractiveLayout(ttk.Frame):
         # move just this handle and update the line's coords in place --
         # never delete+recreate mid-drag (see _bracket_motion for why that
         # breaks Tk's in-progress drag tracking).
-        handles = self.line_handle_ids.get("cut_line")
+        handles = self.line_handle_ids.get(key)
         if handles:
             self.canvas.move(handles[which], dx_px, dy_px)
-        line_cid = self.canvas_ids.get("cut_line")
+        line_cid = self.canvas_ids.get(key)
         if line_cid is not None:
             ncx0, ncy0 = self._pdf_to_canvas(item["x0"], item["y0"])
             ncx1, ncy1 = self._pdf_to_canvas(item["x1"], item["y1"])
             self.canvas.coords(line_cid, ncx0, ncy0, ncx1, ncy1)
 
-    def _cutline_endpoint_release(self, event=None):
+    def _line_endpoint_release(self, event=None):
         self._endpoint_drag = None
         self._sync_scrollregion_to_content()
 
@@ -1767,14 +1811,23 @@ class SingleOrderTab(ttk.Frame):
 
         if profile is None:
             # No calibrated layout for this product yet -- show the
-            # background with no automatic items. Notes/cut-line are still
-            # available (has_background), so this isn't a dead end; Generate
-            # will bake whatever's manually added, just without a material
-            # bar or origin bracket (see InteractiveLayout.load_background_only).
+            # background with no automatic dimension callouts or origin
+            # bracket. The material bar still draws (default position --
+            # see engine.DEFAULT_MATERIAL_BAR) since the Traveler name isn't
+            # a CNC-critical measurement. Notes/cut-line/diagonal-line are
+            # also available (has_background), so this isn't a dead end;
+            # Generate will bake whatever's manually added plus the bar.
             sig = ("bg-only", order_form, production_order)
             if self._loaded_signature != sig:
-                ok = self.layout.load_background_only(order_form, production_order)
+                ok = self.layout.load_background_only(order_form, production_order, material,
+                                                        restore_state=self._pending_restore_state)
+                self._pending_restore_state = None
                 self._loaded_signature = sig if ok else None
+            else:
+                # same order, just a field changed (e.g. Traveler) -- sync()
+                # itself requires self.loaded (profile-based), which this
+                # mode never sets, so update just the material bar directly.
+                self.layout.sync_material(material)
             return
 
         sig = (order_form, production_order)
@@ -1977,11 +2030,13 @@ class SingleOrderTab(ttk.Frame):
             # SKU/dimension format -- e.g. a new Vanity Vessel line). Rather
             # than blocking Generate entirely, fall back to manual-only mode:
             # bake whatever's in the live editor (notes, cut-for-shipping
-            # line) onto the order form, skipping the automatic material bar/
-            # origin bracket/dimension callouts that need calibrated
-            # coordinates this product doesn't have yet. Confirmed
-            # intentional, not a silent guess -- see has_background and
-            # render_page()'s profile=None handling.
+            # line, diagonal line) onto the order form, plus the material bar
+            # at its default position (not CNC-critical, so a reasonable
+            # default is fine -- see engine.DEFAULT_MATERIAL_BAR). Only the
+            # origin bracket/dimension callouts, which do need real
+            # calibration, are skipped. Confirmed intentional, not a silent
+            # guess -- see has_background and render_page()'s profile=None
+            # handling.
             if not self.layout.has_background:
                 messagebox.showerror(
                     "Unknown product",
@@ -1994,7 +2049,8 @@ class SingleOrderTab(ttk.Frame):
             wide_origin = False
             profile_warning = (
                 f"No calibrated layout for SKU '{meta['sku_prefix'] or meta['sku'] or '(unknown)'}' yet -- "
-                "only manually added notes/cut-line were included (no material bar or origin bracket)."
+                "material bar used a default position (drag it if needed); no origin bracket or "
+                "dimension callouts were included."
             )
         else:
             oversize_w = (meta["raw_width_in"] - curb_depth + 1) \
@@ -2172,7 +2228,7 @@ class SingleOrderTab(ttk.Frame):
             oversize_w = None
             wide_origin = False
             brackets = []  # not drawn without a profile anyway -- see render_page()
-            bar_offset = (0.0, 0.0)
+            bar_offset = self.layout.get_bar_offset()  # bar is still draggable in manual mode -- see sync_material()
             page_rotation = self.layout.bg_rotation
             if self.layout.bg_rotation or abs(self.layout.bg_scale - 1.0) > 0.001:
                 order_form_for_merge = engine.get_transformed_order_form(
