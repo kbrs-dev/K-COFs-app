@@ -390,12 +390,30 @@ def apply_update_and_relaunch(staged_app_dir: str) -> None:
     )
     Path(bat_path).write_text(script)
 
-    DETACHED_PROCESS = 0x00000008
+    # CREATE_NO_WINDOW suppresses the console window this batch script would
+    # otherwise flash on screen. NOT combined with DETACHED_PROCESS -- the
+    # two are documented by Microsoft as mutually exclusive, and unnecessary
+    # here anyway: this app.exe itself is windowed (console=False in the
+    # PyInstaller spec), so it has no console for the child to inherit or
+    # need detaching from in the first place.
     CREATE_NEW_PROCESS_GROUP = 0x00000200
+    CREATE_NO_WINDOW = 0x08000000
     subprocess.Popen(
         ["cmd.exe", "/c", bat_path],
-        creationflags=DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP,
+        creationflags=CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW,
         close_fds=True,
+        # Without an explicit cwd, this inherits the CURRENTLY RUNNING app's
+        # working directory -- which for a double-clicked frozen .exe is
+        # its own app_dir. cmd.exe then holds app_dir as ITS OWN current
+        # directory, and Windows refuses to rename a directory a live
+        # process is sitting in -- so the :waitloop's `ren` above failed on
+        # every single try (all 30 of them, each after a visible 1s
+        # `timeout` window) and fell through to :giveup, relaunching the
+        # untouched old build every time. cwd=tempfile.gettempdir() keeps
+        # this script's own directory completely outside app_dir, so the
+        # rename can actually succeed once this process (not cmd.exe) has
+        # exited and released its own lock.
+        cwd=tempfile.gettempdir(),
     )
     os._exit(0)
 
