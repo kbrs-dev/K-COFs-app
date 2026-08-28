@@ -263,6 +263,7 @@ class InteractiveLayout(ttk.Frame):
         self.cut_btn = ttk.Button(self.toolbar, text="Add cut-for-shipping line", command=self.toggle_cut_line)
         self.cut_btn.pack(side="left", padx=(0, 4))
         ttk.Button(self.toolbar, text="Add note", command=self.add_note).pack(side="left", padx=4)
+        ttk.Button(self.toolbar, text="Add diagonal line", command=self.add_diagonal_line).pack(side="left", padx=4)
         ttk.Button(self.toolbar, text="Add bracket", command=self.add_bracket).pack(side="left", padx=4)
         self.undo_btn = ttk.Button(self.toolbar, text="Undo", command=self.undo)
         self.undo_btn.pack(side="left", padx=(12, 4))
@@ -1143,6 +1144,8 @@ class InteractiveLayout(ttk.Frame):
             menu.add_command(label=f"Change to {other} text", command=lambda: self._toggle_note_color(key))
         if key == "cut_line":
             menu.add_command(label="Rotate 90°", command=self._rotate_cut_line)
+        if key.startswith("diagonal_"):
+            menu.add_command(label="Rotate 45°", command=lambda: self._rotate_diagonal_line(key))
         if item.get("deletable"):
             menu.add_command(label="Delete", command=lambda: self._delete_item(key))
         if not item.get("editable_text") and not item.get("deletable"):
@@ -1294,6 +1297,30 @@ class InteractiveLayout(ttk.Frame):
         else:
             item = engine.make_note_item(text=text.replace("\\n", "\n"))
         self.items.append(item)
+        self._draw_item(item)
+
+    def add_diagonal_line(self):
+        """A manual, solid indicator line for a diagonal cut/feature that
+        needs to be visible on the drawing -- purely a visual marker, unlike
+        the dashed cut-for-shipping line, it never changes any oversize
+        dimension. Not tied to any particular product type; add/remove/
+        rotate freely as needed. Multiple can exist, same as notes."""
+        if not self.has_background:
+            return
+        self._push_undo()
+        item = engine.make_diagonal_line_item()
+        self.items.append(item)
+        self._draw_item(item)
+
+    def _rotate_diagonal_line(self, key):
+        item = self._item(key)
+        self._push_undo()
+        cx = (item["x0"] + item["x1"]) / 2
+        cy = (item["y0"] + item["y1"]) / 2
+        pivot = (cx, cy)
+        item["x0"], item["y0"] = engine.rotate_point((item["x0"], item["y0"]), pivot, 45)
+        item["x1"], item["y1"] = engine.rotate_point((item["x1"], item["y1"]), pivot, 45)
+        self._clear_canvas_for(key)
         self._draw_item(item)
 
 

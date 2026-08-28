@@ -996,6 +996,29 @@ def make_cut_line_items() -> list:
     return [line, label]
 
 
+_diagonal_counter = [0]
+
+
+def make_diagonal_line_item() -> dict:
+    """A manual, solid indicator line -- for flagging a diagonal cut or
+    angled feature on the drawing that isn't itself a real dimension. Unlike
+    the dashed cut-for-shipping line above, this is purely a visual marker:
+    it never bumps the oversize width/height, isn't tied to any particular
+    product line (linear or not), and multiple can exist (like notes) since
+    each gets its own counter-based key. Starts at a plain 45-degree angle;
+    draggable as a whole like any other item, and rotatable in 45-degree
+    steps in the live editor (right-click -> Rotate 45°) via the same
+    rotate_point() mechanism as the origin bracket's neo-angle step."""
+    _diagonal_counter[0] += 1
+    cx, cy = PAGE_W / 2, PAGE_H / 2
+    half = 100.0
+    return {
+        "key": f"diagonal_{_diagonal_counter[0]}", "kind": "line",
+        "x0": cx - half, "y0": cy - half, "x1": cx + half, "y1": cy + half,
+        "color": "orange", "line_width": 8.0, "dashed": False, "deletable": True,
+    }
+
+
 _note_counter = [0]
 
 

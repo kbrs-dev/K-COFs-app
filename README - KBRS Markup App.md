@@ -100,10 +100,17 @@ loads an order, every dimension/thickness label is draggable right there:
   whenever a shipping cut is present). Click again to remove it (reverts
   the width bump too).
 - **Add note** — freeform text anywhere, for anything not covered above.
+- **Add diagonal line** — a plain solid indicator line (not dashed, unlike
+  the cut-for-shipping line above), for flagging a diagonal cut or angled
+  feature on the drawing. Purely a visual marker — it never changes any
+  oversize dimension, and isn't tied to any particular product type. Starts
+  at 45°; drag it like any other item, and **right-click → "Rotate 45°"**
+  to spin it in place. Click the toolbar button again to add another one if
+  you need more than one. Right-click → Delete to remove.
 - **Undo / Redo** — buttons in the toolbar, or ⌘Z / ⇧⌘Z (Ctrl+Z / Ctrl+Shift+Z
   on Windows) while the preview has focus. Covers moves, deletes, text
-  edits, notes, and the cut line — use it freely; nothing is final until
-  you click Generate.
+  edits, notes, diagonal lines, and the cut line — use it freely; nothing is
+  final until you click Generate.
 - **Drag the origin bracket** (the orange corner marker) to nudge it if the
   calibrated position doesn't match a real order — useful when a product's
   default rule doesn't fit a specific drain layout. **Right-click it** for

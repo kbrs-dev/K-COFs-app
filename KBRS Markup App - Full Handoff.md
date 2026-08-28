@@ -364,14 +364,26 @@ confirmed 2 pages, page 2 rotated 90°, note text rendered, no material bar/brac
 sandbox has no tkinter to run the live GUI itself — same testing constraint as always for this repo,
 see §2. README updated with a new section explaining this manual-only mode.
 
-**Still open from this session:** the user's third request — "I don't need the diagonal line for all
-vanities only for linear, so it should be optional to remove" — wasn't implemented. Searched this
-entire repo (code + full git history) for any existing "diagonal line" concept and found none: the
-cut-for-shipping line only ever runs vertical/horizontal (never diagonal), the origin bracket is an
-elbow/L-shape with an optional 45°-rotate step for neo-angle showers (not a plain diagonal line),
-and the diagonal cross pattern visible on the vanity order form itself is baked into the customer's
-own PDF template (the "SUMP (SLOPED AREA)" diagram), not something this app draws — so there's no
-existing feature to make optional. Given this is a production/CNC-adjacent app where guessing wrong
-means a wrong physical cut, asked the user to clarify exactly what "the diagonal line" refers to
-before implementing anything, rather than guess at a new geometry feature. Get that answer and
-implement it as the next step.
+**"Diagonal line" clarified and implemented:** the user's third request turned out to describe a
+brand new manual tool, not an existing feature that needed a bug fix — searching the repo/history
+for any existing "diagonal line" concept found none, so this was confirmed with the user before
+building anything (see the questions/answer above): a plain **solid** indicator line (as opposed to
+the dashed cut-for-shipping line) in the app's accent color, purely a visual marker that never
+changes any oversize dimension, added manually (not tied to or auto-populated for any particular
+product type, linear or otherwise), starting at 45° with a right-click "Rotate 45°" step to spin it
+in place.
+
+Added `engine.make_diagonal_line_item()` (counter-keyed like notes, so more than one can exist) —
+render_page()/_content_bbox() already handled generic line-kind items, so no engine rendering
+changes were needed beyond the factory function itself. On the app.py side: a new "Add diagonal
+line" toolbar button (`add_diagonal_line()`, gated on `has_background` like Add note — works with or
+without a calibrated profile), a `_rotate_diagonal_line()` handler (reuses `engine.rotate_point()`
+around the line's own midpoint, same mechanism as the bracket's 45° neo-angle step), and a
+right-click menu entry for any `diagonal_*` key. Whole-line dragging worked for free (the existing
+`_press`/`_motion` handlers are already generic across all line-kind items); endpoint-drag
+(extend/shorten one end independently) was deliberately *not* generalized from the cut-line's
+hardcoded version — the user only asked for drag-to-reposition + 45° rotate, not free-length
+adjustment, so that's a reasonable next step if it's ever actually wanted, not a gap in this one.
+Verified headlessly: rotation math round-trips exactly after 8×45° (back to the original endpoints,
+sub-microinch), and it renders correctly both with a calibrated profile and in profile=None
+(manual-only) mode. README updated with a description of the new toolbar button.
