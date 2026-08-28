@@ -32,8 +32,17 @@ PRODUCT LINES COVERED (SKU prefix -> product):
     CLTB   Custom Linear Tile-Basin
     CTB    Custom (point-drain) Tile-Basin
     CFSRC  Custom Flanged Surface Ready Core (SRC)
-Each was calibrated from one real finished example. New product lines need a
-sample order form + finished markup to add a profile.
+    SRC-D1 Custom SRC, D1 variant -- pilot hole, no flange (auto-adds a
+           '0.5" PILOT HOLE - NO FLANGE' note; reuses CFSRC's layout, not yet
+           confirmed against a real D1 example -- see EXTENDED_SKU_PREFIXES)
+    SRC-D3 Custom SRC, D3 variant -- flanged (auto-adds the same flange note
+           as Blue Traveler; reuses CFSRC's layout, not yet confirmed against
+           a real D3 example -- see EXTENDED_SKU_PREFIXES)
+Each of the first five was calibrated from one real finished example.
+SRC-D1/D3 reuse CFSRC's already-confirmed coordinates rather than a new
+guess, since the only known difference is which note gets auto-added -- flag
+it if a real example shows the geometry itself actually differs. New product
+lines need a sample order form + finished markup to add a profile.
 
 DIMENSION RULES:
     - Oversize width = raw width + 1" for every product line (confirmed on all 5).
@@ -770,9 +779,65 @@ PROFILES = {
         "font_size_material": 24,
         "font_size_thickness": 36,
     },
+    # SRC-D1/SRC-D3: the two drain-hole variants of the same SRC product as
+    # CFSRC above (D1 = pilot hole, no flange; D3 = flanged) -- reuse CFSRC's
+    # calibrated layout as-is (same physical order form/diagram, confirmed
+    # real coordinates, not a new guess) since the only confirmed difference
+    # between the variants is which note gets auto-added, not the geometry.
+    # If a real D1/D3 example turns out to need different width/length/
+    # bracket positions, recalibrate these two independently rather than
+    # assuming they'll always match CFSRC.
+    "SRC-D1": {
+        "name": "Custom SRC - D1 (pilot hole, no flange)",
+        "curb_affects_height": False,
+        "auto_note": "pilot_hole",  # see make_pilot_hole_note_item() / _sync_pilot_hole_note() in app.py
+        "width_cover": (42.43, PAGE_H - 375.87, 126.0, PAGE_H - 329.82),
+        "width_text_pos": (67.1, PAGE_H - 372.4),
+        "length_cover": (428.4, PAGE_H - 246.6, 513.69, PAGE_H - 200.55),
+        "length_text_pos": (440.5, PAGE_H - 243.3),
+        "thickness_cover": (306.0, PAGE_H - 458.26, 449.76, PAGE_H - 407.37),
+        "thickness_text_pos": (343.9, PAGE_H - 454.2),
+        "material_bar": (37.97, PAGE_H - 756.6, 230.75, PAGE_H - 726.6),
+        "material_text_pos": (51.0, PAGE_H - 750.3),
+        "bracket": [(193.696, PAGE_H - 225.7176), (135.734, PAGE_H - 225.7176), (135.734, PAGE_H - 286.7022)],
+        "bracket_width": 10.0,
+        "font_size_dim": 32,
+        "font_size_material": 24,
+        "font_size_thickness": 36,
+    },
+    "SRC-D3": {
+        "name": "Custom SRC - D3 (flanged)",
+        "curb_affects_height": False,
+        "auto_note": "flange",  # see make_flange_note_item() / _sync_flange_note() in app.py
+        "width_cover": (42.43, PAGE_H - 375.87, 126.0, PAGE_H - 329.82),
+        "width_text_pos": (67.1, PAGE_H - 372.4),
+        "length_cover": (428.4, PAGE_H - 246.6, 513.69, PAGE_H - 200.55),
+        "length_text_pos": (440.5, PAGE_H - 243.3),
+        "thickness_cover": (306.0, PAGE_H - 458.26, 449.76, PAGE_H - 407.37),
+        "thickness_text_pos": (343.9, PAGE_H - 454.2),
+        "material_bar": (37.97, PAGE_H - 756.6, 230.75, PAGE_H - 726.6),
+        "material_text_pos": (51.0, PAGE_H - 750.3),
+        "bracket": [(193.696, PAGE_H - 225.7176), (135.734, PAGE_H - 225.7176), (135.734, PAGE_H - 286.7022)],
+        "bracket_width": 10.0,
+        "font_size_dim": 32,
+        "font_size_material": 24,
+        "font_size_thickness": 36,
+    },
 }
 
 SKU_PREFIX_RE = re.compile(r"^([A-Z]+)-")
+
+# SRC-D1/SRC-D3 (see PROFILES) need a two-segment prefix ("SRC-D1", not just
+# "SRC") to tell the two drain-hole variants apart -- SKU_PREFIX_RE above
+# only ever captures the plain letters before the first hyphen, which can't
+# distinguish them. This list is a best-effort guess at the real SKU format
+# (not yet confirmed against an actual SRC-D1/SRC-D3 production order --
+# unlike every other calibrated coordinate in this file, this one hasn't
+# been seen on a real example); if it turns out KBRS's SKUs don't actually
+# look like "SRC-D1-1234", auto-detection just won't match here and falls
+# through to manual-only mode same as any other unrecognized SKU -- the
+# Product Type override dropdown always works as a fallback regardless.
+EXTENDED_SKU_PREFIXES = ("SRC-D1", "SRC-D3")
 
 
 def inches_to_decimal(s: str) -> float:
@@ -894,6 +959,13 @@ def parse_production_order(pdf_path: str) -> dict:
         sku, item_name, raw_w, raw_h = item_match.groups()
         prefix_match = SKU_PREFIX_RE.match(sku)
         sku_prefix = prefix_match.group(1) if prefix_match else sku.split("-")[0]
+        # SRC-D1/SRC-D3 need their second hyphen-segment too -- see
+        # EXTENDED_SKU_PREFIXES's docstring above.
+        segments = sku.split("-")
+        if len(segments) >= 2:
+            extended_prefix = f"{segments[0]}-{segments[1]}"
+            if extended_prefix in EXTENDED_SKU_PREFIXES:
+                sku_prefix = extended_prefix
         item_name = item_name.strip()
         raw_width_in = inches_to_decimal(raw_w)
         raw_height_in = inches_to_decimal(raw_h)
@@ -1074,6 +1146,25 @@ def make_drain_plate_note_item() -> dict:
     return {
         "key": DRAIN_PLATE_NOTE_KEY, "kind": "text", "text": DRAIN_PLATE_NOTE_TEXT,
         "x": PAGE_W / 2 - 130, "y": 120.0, "font_size": 20, "color": "orange",
+        "fixed_cover": None, "moved": True, "deletable": True, "editable_text": True,
+    }
+
+
+# SRC comes in two drain-hole variants that otherwise share the same
+# calibrated layout (see PROFILES["SRC-D1"]/["SRC-D3"] below): D3 is flanged
+# (auto-adds the same FLANGE_NOTE_TEXT as Blue Traveler -- see
+# InteractiveLayout._sync_flange_note() in app.py, which checks a profile's
+# "auto_note" key too, not just material), D1 has a pilot hole and no flange
+# instead. Driven purely by product type (profile["auto_note"]), unlike the
+# material-or-checkbox-driven notes above.
+PILOT_HOLE_NOTE_KEY = "pilot_hole_note"
+PILOT_HOLE_NOTE_TEXT = '0.5" PILOT HOLE - NO FLANGE'
+
+
+def make_pilot_hole_note_item() -> dict:
+    return {
+        "key": PILOT_HOLE_NOTE_KEY, "kind": "text", "text": PILOT_HOLE_NOTE_TEXT,
+        "x": PAGE_W / 2 - 130, "y": 140.0, "font_size": 18, "color": "black",
         "fixed_cover": None, "moved": True, "deletable": True, "editable_text": True,
     }
 
