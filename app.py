@@ -248,6 +248,10 @@ class InteractiveLayout(ttk.Frame):
         self._flange_note_dismissed = False
         # same idea for the checkbox-driven Keyhole Linear drain-plate note
         self._drain_plate_note_dismissed = False
+        # same idea again for the SRC-D1 pilot-hole note (product-type-driven,
+        # like the flange note above but keyed off the SKU variant instead of
+        # the material)
+        self._pilot_hole_note_dismissed = False
 
         self.placeholder = ttk.Label(self, text="Load an order form to see it here", foreground="#777",
                                       background="#eeeeee", relief="sunken", wraplength=340, justify="center")
@@ -583,15 +587,21 @@ class InteractiveLayout(ttk.Frame):
             self.bar_offset = restore_state["bar_offset"]
             self.items = copy.deepcopy(restore_state["items"])
             # infer whether the flange note was deliberately dismissed in the
-            # saved markup (Blue Traveler but no flange note present), so
-            # sync() doesn't immediately re-add it against the restored state
+            # saved markup (Blue Traveler, or a product-type variant that
+            # auto-adds it, but no flange note present), so sync() doesn't
+            # immediately re-add it against the restored state
+            needs_flange = engine.is_blue_traveler(material) or (profile or {}).get("auto_note") == "flange"
             self._flange_note_dismissed = (
-                engine.is_blue_traveler(material)
+                needs_flange
                 and not any(i["key"] == engine.FLANGE_NOTE_KEY for i in self.items)
             )
             self._drain_plate_note_dismissed = (
                 keyhole_linear
                 and not any(i["key"] == engine.DRAIN_PLATE_NOTE_KEY for i in self.items)
+            )
+            self._pilot_hole_note_dismissed = (
+                (profile or {}).get("auto_note") == "pilot_hole"
+                and not any(i["key"] == engine.PILOT_HOLE_NOTE_KEY for i in self.items)
             )
         else:
             self.has_cut_line = False
@@ -602,6 +612,8 @@ class InteractiveLayout(ttk.Frame):
             self._sync_flange_note(material)
             self._drain_plate_note_dismissed = False
             self._sync_drain_plate_note(keyhole_linear)
+            self._pilot_hole_note_dismissed = False
+            self._sync_pilot_hole_note()
 
         self.bg_photo = ImageTk.PhotoImage(pil_img)
         self.preview_page = 1
@@ -664,6 +676,7 @@ class InteractiveLayout(ttk.Frame):
 
         self._sync_flange_note(material)
         self._sync_drain_plate_note(keyhole_linear)
+        self._sync_pilot_hole_note()
 
         if self._dragging_bracket is None and not self._bar_dragging:
             self._draw_static_bar_and_bracket()
@@ -682,15 +695,17 @@ class InteractiveLayout(ttk.Frame):
             self._draw_static_bar_and_bracket()
 
     def _sync_flange_note(self, material):
-        """Blue Traveler orders standardly need a 'FLANGE ON ALL SIDES' note
-        -- auto-add one when that material is selected/detected, same on/off-
+        """Blue Traveler orders standardly need a 'FLANGE ON ALL SIDES' note,
+        and so does the SRC-D3 product variant (flanged, as opposed to
+        SRC-D1's pilot hole -- see _sync_pilot_hole_note()) regardless of
+        material -- either trigger auto-adds the same note, same on/off-
         driven-by-a-field pattern as the thickness item above. Deleting it
         manually (right-click) marks it dismissed for this order so it won't
-        just come back on the next field edit; picking a different material
-        and back to Blue Traveler again re-offers it (dismissal is cleared as
-        soon as the material isn't Blue Traveler, whether or not there was
-        still a note left to remove at that point)."""
-        needs_flange = engine.is_blue_traveler(material)
+        just come back on the next field edit; satisfying either trigger
+        again re-offers it (dismissal is cleared as soon as neither trigger
+        applies, whether or not there was still a note left to remove at
+        that point)."""
+        needs_flange = engine.is_blue_traveler(material) or (self.profile or {}).get("auto_note") == "flange"
         existing = next((i for i in self.items if i["key"] == engine.FLANGE_NOTE_KEY), None)
         if not needs_flange:
             self._flange_note_dismissed = False
@@ -700,6 +715,26 @@ class InteractiveLayout(ttk.Frame):
             return
         if not existing and not self._flange_note_dismissed:
             item = engine.make_flange_note_item()
+            self.items.append(item)
+            if self.loaded:
+                self._draw_item(item)
+
+    def _sync_pilot_hole_note(self):
+        """SRC-D1 orders (pilot hole, no flange -- the counterpart to
+        SRC-D3's flange note above) standardly need a '0.5" PILOT HOLE - NO
+        FLANGE' note -- auto-added purely from the product type, unlike the
+        flange note which can also be triggered by material. Same dismiss/
+        re-offer pattern as the other auto-notes."""
+        needs_note = (self.profile or {}).get("auto_note") == "pilot_hole"
+        existing = next((i for i in self.items if i["key"] == engine.PILOT_HOLE_NOTE_KEY), None)
+        if not needs_note:
+            self._pilot_hole_note_dismissed = False
+            if existing and self.drag_key != engine.PILOT_HOLE_NOTE_KEY:
+                self._clear_canvas_for(engine.PILOT_HOLE_NOTE_KEY)
+                self.items.remove(existing)
+            return
+        if not existing and not self._pilot_hole_note_dismissed:
+            item = engine.make_pilot_hole_note_item()
             self.items.append(item)
             if self.loaded:
                 self._draw_item(item)
@@ -1253,6 +1288,8 @@ class InteractiveLayout(ttk.Frame):
             self._flange_note_dismissed = True
         if key == engine.DRAIN_PLATE_NOTE_KEY:
             self._drain_plate_note_dismissed = True
+        if key == engine.PILOT_HOLE_NOTE_KEY:
+            self._pilot_hole_note_dismissed = True
         if key == "cut_line":
             # also drop the paired label and revert the oversize bump from
             # whichever axis it's currently on (may have been rotated since
