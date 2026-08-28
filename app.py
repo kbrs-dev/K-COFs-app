@@ -200,6 +200,14 @@ class InteractiveLayout(ttk.Frame):
     def __init__(self, master):
         super().__init__(master)
         self.loaded = False
+        # True whenever an order-form background is showing at all, whether
+        # or not it has a calibrated profile -- separate from self.loaded
+        # (which additionally means "profile-based, matches()/get_items()
+        # reflect a real order") so that manual-only tools (Add note, Add
+        # cut-for-shipping line) work for a product with no calibrated
+        # layout yet, not just a fully profile-resolved one. See
+        # load_background_only() below.
+        self.has_background = False
         self.order_form_path = None
         self.production_order_path = None
         self.profile = None
@@ -255,6 +263,7 @@ class InteractiveLayout(ttk.Frame):
         self.cut_btn = ttk.Button(self.toolbar, text="Add cut-for-shipping line", command=self.toggle_cut_line)
         self.cut_btn.pack(side="left", padx=(0, 4))
         ttk.Button(self.toolbar, text="Add note", command=self.add_note).pack(side="left", padx=4)
+        ttk.Button(self.toolbar, text="Add diagonal line", command=self.add_diagonal_line).pack(side="left", padx=4)
         ttk.Button(self.toolbar, text="Add bracket", command=self.add_bracket).pack(side="left", padx=4)
         self.undo_btn = ttk.Button(self.toolbar, text="Undo", command=self.undo)
         self.undo_btn.pack(side="left", padx=(12, 4))
@@ -299,6 +308,7 @@ class InteractiveLayout(ttk.Frame):
     # -- state / visibility --------------------------------------------------
     def show_placeholder(self, text):
         self.loaded = False
+        self.has_background = False
         self.page_nav.pack_forget()
         self.toolbar.pack_forget()
         self.hint.pack_forget()
@@ -488,9 +498,16 @@ class InteractiveLayout(ttk.Frame):
         pdf.close()
         return pil_img, real_page_w, real_page_h
 
-    def load_background_only(self, order_form_path):
-        """Order form picked, but no valid profile yet (production order not
-        read/recognized) -- show just the background, no items."""
+    def load_background_only(self, order_form_path, production_order_path=None):
+        """Order form picked, but no calibrated profile yet -- either the
+        production order hasn't been read, or it parsed fine but the product
+        line itself has no PROFILES entry (e.g. a genuinely new product like
+        a Vanity Vessel, whose production order also doesn't even follow the
+        usual SKU/dimension text format). Shows just the background with no
+        automatic items -- but Add note / Add cut-for-shipping line still
+        work (see has_background), since neither needs a calibrated
+        position. Only the profile-driven material bar and origin bracket
+        are unavailable here."""
         self.bg_rotation = 0
         self.bg_scale = 1.0
         try:
@@ -501,8 +518,9 @@ class InteractiveLayout(ttk.Frame):
             return False
 
         self.loaded = False  # background-only isn't a "loaded order" for matches()/get_items() purposes
+        self.has_background = True
         self.order_form_path = order_form_path
-        self.production_order_path = None
+        self.production_order_path = production_order_path
         self.profile = None
         self.real_page_w, self.real_page_h = real_page_w, real_page_h
         self.items = []
@@ -572,6 +590,7 @@ class InteractiveLayout(ttk.Frame):
         self.cut_btn.config(text="Remove cut-for-shipping line" if self.has_cut_line else "Add cut-for-shipping line")
         self._update_undo_redo_buttons()
         self.loaded = True
+        self.has_background = True
         return True
 
     def get_recent_order_layout_state(self):
@@ -982,6 +1001,14 @@ class InteractiveLayout(ttk.Frame):
         for an order that needs a second independent reference point rather
         than a copy of one that's already been repositioned."""
         if not self.loaded:
+            if self.has_background:
+                messagebox.showinfo(
+                    "No calibrated position yet",
+                    "This product doesn't have a calibrated origin bracket position yet, "
+                    "so there's no default spot to place one at.\n\n"
+                    "Use Add note instead to mark the CNC/CAD reference point manually.",
+                    parent=self,
+                )
             return
         self._push_undo()
         self.brackets.append({"offset": (0.0, 0.0), "rotation": 0})
@@ -1117,6 +1144,8 @@ class InteractiveLayout(ttk.Frame):
             menu.add_command(label=f"Change to {other} text", command=lambda: self._toggle_note_color(key))
         if key == "cut_line":
             menu.add_command(label="Rotate 90°", command=self._rotate_cut_line)
+        if key.startswith("diagonal_"):
+            menu.add_command(label="Rotate 45°", command=lambda: self._rotate_diagonal_line(key))
         if item.get("deletable"):
             menu.add_command(label="Delete", command=lambda: self._delete_item(key))
         if not item.get("editable_text") and not item.get("deletable"):
@@ -1199,7 +1228,7 @@ class InteractiveLayout(ttk.Frame):
 
     # -- toolbar actions -----------------------------------------------------
     def toggle_cut_line(self):
-        if not self.loaded:
+        if not self.has_background:
             return
         if self.has_cut_line:
             self._delete_item("cut_line")  # pushes its own undo snapshot
@@ -1252,7 +1281,7 @@ class InteractiveLayout(ttk.Frame):
         return engine.CUT_FOR_SHIPPING_EXTRA_IN, 0.0
 
     def add_note(self):
-        if not self.loaded:
+        if not self.has_background:
             return
         text = simpledialog.askstring("Add note", "Note text (use \\n for a line break):", parent=self)
         if not text:
@@ -1268,6 +1297,30 @@ class InteractiveLayout(ttk.Frame):
         else:
             item = engine.make_note_item(text=text.replace("\\n", "\n"))
         self.items.append(item)
+        self._draw_item(item)
+
+    def add_diagonal_line(self):
+        """A manual, solid indicator line for a diagonal cut/feature that
+        needs to be visible on the drawing -- purely a visual marker, unlike
+        the dashed cut-for-shipping line, it never changes any oversize
+        dimension. Not tied to any particular product type; add/remove/
+        rotate freely as needed. Multiple can exist, same as notes."""
+        if not self.has_background:
+            return
+        self._push_undo()
+        item = engine.make_diagonal_line_item()
+        self.items.append(item)
+        self._draw_item(item)
+
+    def _rotate_diagonal_line(self, key):
+        item = self._item(key)
+        self._push_undo()
+        cx = (item["x0"] + item["x1"]) / 2
+        cy = (item["y0"] + item["y1"]) / 2
+        pivot = (cx, cy)
+        item["x0"], item["y0"] = engine.rotate_point((item["x0"], item["y0"]), pivot, 45)
+        item["x1"], item["y1"] = engine.rotate_point((item["x1"], item["y1"]), pivot, 45)
+        self._clear_canvas_for(key)
         self._draw_item(item)
 
 
@@ -1713,10 +1766,14 @@ class SingleOrderTab(ttk.Frame):
         material = self.material.get().strip() or "TRAVELER"
 
         if profile is None:
-            # can't compute annotation items yet -- just show the background
-            sig = ("bg-only", order_form)
+            # No calibrated layout for this product yet -- show the
+            # background with no automatic items. Notes/cut-line are still
+            # available (has_background), so this isn't a dead end; Generate
+            # will bake whatever's manually added, just without a material
+            # bar or origin bracket (see InteractiveLayout.load_background_only).
+            sig = ("bg-only", order_form, production_order)
             if self._loaded_signature != sig:
-                ok = self.layout.load_background_only(order_form)
+                ok = self.layout.load_background_only(order_form, production_order)
                 self._loaded_signature = sig if ok else None
             return
 
@@ -1763,9 +1820,16 @@ class SingleOrderTab(ttk.Frame):
         something different) so a wrong read is easy to spot and correct --
         same override-respecting pattern as thickness/drain-A.
 
-        Returns (meta, profile, error). meta's po_number/so_number/item_name/
-        sku are None if the file itself couldn't be parsed at all (manual
-        entry only); error is a user-facing string, or None on success."""
+        Returns (meta, profile, error). meta is None only when the manual
+        width/height fields themselves contain unparseable text -- otherwise
+        meta is always a dict (po_number/so_number/sku/item_name/raw_width_in/
+        raw_height_in individually None wherever neither the file nor a
+        manual override supplied them, e.g. a production order for a brand
+        new product line that doesn't follow the usual SKU/dimension format
+        at all). error is a user-facing string, set whenever profile
+        resolution isn't (yet) possible -- callers that support manual-only
+        editing without a profile (see has_background) should treat a
+        non-None meta with profile=None as informational, not fatal."""
         po_path = self.production_order_path.get()
         parsed = None
         parse_error = None
@@ -1780,6 +1844,8 @@ class SingleOrderTab(ttk.Frame):
                 ("raw_width_in", self.raw_width, "_last_auto_raw_width"),
                 ("raw_height_in", self.raw_height, "_last_auto_raw_height"),
             ):
+                if parsed[field] is None:
+                    continue  # not on this production order's item line (e.g. unrecognized format) -- leave manual
                 auto_text = engine.fmt_inches(parsed[field])
                 current = var.get().strip()
                 if (not current or current == getattr(self, last_attr)) and current != auto_text:
@@ -1798,23 +1864,25 @@ class SingleOrderTab(ttk.Frame):
         except ValueError:
             return None, None, 'Raw width/height must be a number or fraction, e.g. 78 or "78 1/4".'
 
-        if raw_width_in is None or raw_height_in is None or sku_prefix is None:
-            if parse_error is not None:
-                return None, None, f"Could not read the production order file: {parse_error}"
-            return None, None, "Fill in the Raw width/height and Product type overrides below, or choose a readable production order PDF."
-
-        if self.swap_width_height.get():
-            raw_width_in, raw_height_in = raw_height_in, raw_width_in
-
         meta = {
             "po_number": parsed["po_number"] if parsed else None,
             "so_number": parsed["so_number"] if parsed else None,
-            "sku": parsed["sku"] if parsed else sku_prefix,
+            "sku": (parsed["sku"] if parsed else None) or sku_prefix,
             "sku_prefix": sku_prefix,
-            "item_name": parsed["item_name"] if parsed else "",
+            "item_name": (parsed["item_name"] if parsed else None) or "",
             "raw_width_in": raw_width_in,
             "raw_height_in": raw_height_in,
         }
+
+        if raw_width_in is None or raw_height_in is None or sku_prefix is None:
+            if parse_error is not None:
+                return meta, None, f"Could not read the production order file: {parse_error}"
+            return meta, None, "Fill in the Raw width/height and Product type overrides below, or choose a readable production order PDF."
+
+        if self.swap_width_height.get():
+            raw_width_in, raw_height_in = raw_height_in, raw_width_in
+            meta["raw_width_in"], meta["raw_height_in"] = raw_width_in, raw_height_in
+
         return meta, engine.PROFILES.get(sku_prefix), None
 
     def preview(self):
@@ -1898,24 +1966,45 @@ class SingleOrderTab(ttk.Frame):
             return None
 
         meta, profile, error = self._resolve_production_meta()
-        if error:
+        if meta is None:
             messagebox.showerror("Couldn't read production order", error)
             return None
-        if not profile:
-            messagebox.showerror(
-                "Unknown product",
-                f"No annotation layout yet for SKU prefix '{meta['sku_prefix']}'. Send a sample form for this product line.",
-            )
-            return None
 
-        oversize_w = (meta["raw_width_in"] - curb_depth + 1) \
-            if (profile.get("curb_affects_height") and self.curb_affects_width.get()) \
-            else meta["raw_width_in"] + 1
-        if profile.get("curb_affects_height"):
-            oversize_h = meta["raw_height_in"] - curb_depth + 1
+        profile_warning = None
+        if not profile:
+            # No calibrated layout for this product yet (unrecognized SKU, or
+            # a production order that doesn't even follow the usual
+            # SKU/dimension format -- e.g. a new Vanity Vessel line). Rather
+            # than blocking Generate entirely, fall back to manual-only mode:
+            # bake whatever's in the live editor (notes, cut-for-shipping
+            # line) onto the order form, skipping the automatic material bar/
+            # origin bracket/dimension callouts that need calibrated
+            # coordinates this product doesn't have yet. Confirmed
+            # intentional, not a silent guess -- see has_background and
+            # render_page()'s profile=None handling.
+            if not self.layout.has_background:
+                messagebox.showerror(
+                    "Unknown product",
+                    f"No annotation layout yet for SKU prefix '{meta['sku_prefix']}'. "
+                    "Send a sample form for this product line, or add notes manually in the "
+                    "preview panel above first.",
+                )
+                return None
+            oversize_w = oversize_h = None
+            wide_origin = False
+            profile_warning = (
+                f"No calibrated layout for SKU '{meta['sku_prefix'] or meta['sku'] or '(unknown)'}' yet -- "
+                "only manually added notes/cut-line were included (no material bar or origin bracket)."
+            )
         else:
-            oversize_h = meta["raw_height_in"] + 1
-        wide_origin = "bracket_wide" in profile and meta["raw_width_in"] > engine.WIDE_PANEL_THRESHOLD_IN
+            oversize_w = (meta["raw_width_in"] - curb_depth + 1) \
+                if (profile.get("curb_affects_height") and self.curb_affects_width.get()) \
+                else meta["raw_width_in"] + 1
+            if profile.get("curb_affects_height"):
+                oversize_h = meta["raw_height_in"] - curb_depth + 1
+            else:
+                oversize_h = meta["raw_height_in"] + 1
+            wide_origin = "bracket_wide" in profile and meta["raw_width_in"] > engine.WIDE_PANEL_THRESHOLD_IN
 
         typed_name = self.out_name.get().strip()
         if typed_name:
@@ -1930,7 +2019,7 @@ class SingleOrderTab(ttk.Frame):
             "order_form": order_form, "production_order": production_order,
             "material": material, "thickness": thickness or "", "curb_depth": curb_depth,
             "meta": meta, "profile": profile, "oversize_w": oversize_w, "oversize_h": oversize_h,
-            "wide_origin": wide_origin, "out_path": out_path,
+            "wide_origin": wide_origin, "out_path": out_path, "profile_warning": profile_warning,
         }
 
     def open_recent_order(self, entry):
@@ -2068,41 +2157,60 @@ class SingleOrderTab(ttk.Frame):
         self.status.config(text="Working…", foreground="#555")
         self.update_idletasks()
 
-        # use whatever's currently in the live layout (including any drags,
-        # edits, notes, or a cut-for-shipping line) if it matches this exact
-        # order; otherwise fall back to fresh default positions
-        matches = self.layout.matches(ctx["order_form"], ctx["production_order"])
         # Always normalized to a portrait PAGE_W x PAGE_H page (see
         # normalize_to_portrait_page()) even with no manual rotate/resize --
         # only overridden below if bg_rotation/bg_scale add something on top.
         order_form_for_merge = engine.get_transformed_order_form(ctx["order_form"])
-        if matches:
+        if ctx["profile"] is None:
+            # Manual-only mode (see _validate_and_prepare()'s profile_warning) --
+            # there's no calibrated default layout to fall back to, so this
+            # always uses whatever's currently in the live editor (notes,
+            # cut-for-shipping line) rather than matches()/compute_default_items(),
+            # neither of which make sense without a profile.
+            matches = True  # for the recent-order bookkeeping below: the live layout IS what got rendered here
             items = self.layout.get_items()
-            oversize_w = self.layout.oversize_w  # includes the cut-for-shipping bump, if present
-            wide_origin = self.layout.wide_origin
-            brackets = self.layout.get_brackets()  # manual nudge(s)/rotation(s) from the live preview, if any
-            bar_offset = self.layout.get_bar_offset()  # manual nudge for the Traveler bar, if any
+            oversize_w = None
+            wide_origin = False
+            brackets = []  # not drawn without a profile anyway -- see render_page()
+            bar_offset = (0.0, 0.0)
             page_rotation = self.layout.bg_rotation
             if self.layout.bg_rotation or abs(self.layout.bg_scale - 1.0) > 0.001:
                 order_form_for_merge = engine.get_transformed_order_form(
                     ctx["order_form"], self.layout.bg_rotation, self.layout.bg_scale)
-            if self.layout.bg_rotation:
-                # Rotating the background swaps its width/height -- without
-                # also rotating the overlay's own coordinates to match,
-                # merge_pdf()'s canonical->real scaling has to squash it
-                # non-uniformly to fit, visibly stretching the dimension
-                # text/lines (the background itself doesn't stretch since
-                # it's rotated as a proper image, not just scaled).
-                items, brackets = engine.rotate_overlay_for_page(
-                    ctx["profile"], wide_origin, items, brackets, self.layout.bg_rotation)
+            if page_rotation:
+                items, brackets = engine.rotate_overlay_for_page(None, False, items, brackets, page_rotation)
         else:
-            items = engine.compute_default_items(ctx["profile"], ctx["oversize_w"], ctx["oversize_h"],
-                                                   thickness=ctx["thickness"])
-            oversize_w = ctx["oversize_w"]
-            wide_origin = ctx["wide_origin"]
-            brackets = [{"offset": (0.0, 0.0), "rotation": 0}]
-            bar_offset = (0.0, 0.0)
-            page_rotation = 0
+            # use whatever's currently in the live layout (including any drags,
+            # edits, notes, or a cut-for-shipping line) if it matches this exact
+            # order; otherwise fall back to fresh default positions
+            matches = self.layout.matches(ctx["order_form"], ctx["production_order"])
+            if matches:
+                items = self.layout.get_items()
+                oversize_w = self.layout.oversize_w  # includes the cut-for-shipping bump, if present
+                wide_origin = self.layout.wide_origin
+                brackets = self.layout.get_brackets()  # manual nudge(s)/rotation(s) from the live preview, if any
+                bar_offset = self.layout.get_bar_offset()  # manual nudge for the Traveler bar, if any
+                page_rotation = self.layout.bg_rotation
+                if self.layout.bg_rotation or abs(self.layout.bg_scale - 1.0) > 0.001:
+                    order_form_for_merge = engine.get_transformed_order_form(
+                        ctx["order_form"], self.layout.bg_rotation, self.layout.bg_scale)
+                if self.layout.bg_rotation:
+                    # Rotating the background swaps its width/height -- without
+                    # also rotating the overlay's own coordinates to match,
+                    # merge_pdf()'s canonical->real scaling has to squash it
+                    # non-uniformly to fit, visibly stretching the dimension
+                    # text/lines (the background itself doesn't stretch since
+                    # it's rotated as a proper image, not just scaled).
+                    items, brackets = engine.rotate_overlay_for_page(
+                        ctx["profile"], wide_origin, items, brackets, self.layout.bg_rotation)
+            else:
+                items = engine.compute_default_items(ctx["profile"], ctx["oversize_w"], ctx["oversize_h"],
+                                                       thickness=ctx["thickness"])
+                oversize_w = ctx["oversize_w"]
+                wide_origin = ctx["wide_origin"]
+                brackets = [{"offset": (0.0, 0.0), "rotation": 0}]
+                bar_offset = (0.0, 0.0)
+                page_rotation = 0
         try:
             overlay_bytes, overlay_min_x, overlay_min_y = engine.render_page(
                 ctx["profile"], ctx["material"], items, wide_origin=wide_origin,
@@ -2165,11 +2273,12 @@ class SingleOrderTab(ttk.Frame):
         except Exception as e:
             page_note = f"  ⚠ Couldn't verify the saved file ({type(e).__name__}: {e})."
 
-        thickness_unsupported = bool(ctx["thickness"]) and "thickness_text_pos" not in ctx["profile"]
+        thickness_unsupported = bool(ctx["thickness"]) and (ctx["profile"] is None or "thickness_text_pos" not in ctx["profile"])
         wide_msg = "  ⚠ WIDE PANEL: origin moved to bottom-left, please verify." if wide_origin else ""
         thick_msg = "  ⚠ Thickness entered but not supported for this product yet — it was skipped." if thickness_unsupported else ""
+        profile_msg = f"  ⚠ {ctx['profile_warning']}" if ctx.get("profile_warning") else ""
         status_color = "#b00020" if page_note else "#0a7d2c"
-        self.status.config(text=f"Done → {ctx['out_path']} (2 pages, page 2 rotated){wide_msg}{thick_msg}{page_note}",
+        self.status.config(text=f"Done → {ctx['out_path']} (2 pages, page 2 rotated){wide_msg}{thick_msg}{profile_msg}{page_note}",
                             foreground=status_color)
 
 

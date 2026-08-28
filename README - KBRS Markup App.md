@@ -100,10 +100,17 @@ loads an order, every dimension/thickness label is draggable right there:
   whenever a shipping cut is present). Click again to remove it (reverts
   the width bump too).
 - **Add note** — freeform text anywhere, for anything not covered above.
+- **Add diagonal line** — a plain solid indicator line (not dashed, unlike
+  the cut-for-shipping line above), for flagging a diagonal cut or angled
+  feature on the drawing. Purely a visual marker — it never changes any
+  oversize dimension, and isn't tied to any particular product type. Starts
+  at 45°; drag it like any other item, and **right-click → "Rotate 45°"**
+  to spin it in place. Click the toolbar button again to add another one if
+  you need more than one. Right-click → Delete to remove.
 - **Undo / Redo** — buttons in the toolbar, or ⌘Z / ⇧⌘Z (Ctrl+Z / Ctrl+Shift+Z
   on Windows) while the preview has focus. Covers moves, deletes, text
-  edits, notes, and the cut line — use it freely; nothing is final until
-  you click Generate.
+  edits, notes, diagonal lines, and the cut line — use it freely; nothing is
+  final until you click Generate.
 - **Drag the origin bracket** (the orange corner marker) to nudge it if the
   calibrated position doesn't match a real order — useful when a product's
   default rule doesn't fit a specific drain layout. **Right-click it** for
@@ -134,6 +141,22 @@ Five product lines, each calibrated from one real finished example:
 | CLTB | Custom Linear Tile-Basin | Yes (varies, no safe default) | Yes |
 | CTB | Custom Tile-Basin (point drain) | No calibrated spot yet — will warn if entered | Yes |
 | CFSRC | Custom Flanged SRC | Yes, always 1.5" per KBRS (type it in — no auto-fill) | No |
+
+## A brand new product line with no calibrated layout yet (e.g. Vanity Vessels)
+
+Load an order form + production order for a product that isn't one of the
+five above (or whose production order doesn't even follow the usual
+"SKU-CODE: name (WxH)" text format, like a Custom Vanity Vessel) and the app
+still loads the order form as the background — it just skips the automatic
+material bar, origin bracket, and dimension callouts, since there's no
+calibrated position for any of them yet. **Add note** and **Add cut-for-shipping
+line** still work in this mode (neither needs a calibrated position), so you
+can mark up the order entirely by hand — drag notes wherever they need to go,
+type in the measurements/material/whatever else the order needs. Clicking
+**Generate** bakes exactly what's in the preview onto the order form, and the
+status line flags that it was manual-only so it's never mistaken for a fully
+calibrated export. Send a sample blank order form + a finished markup for the
+product and I'll add it as a real calibrated profile.
 
 Thickness works on any product with a calibrated position; default is always
 blank (nothing shown unless you type something in). To add a thickness spot

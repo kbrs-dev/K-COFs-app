@@ -890,12 +890,26 @@ def parse_production_order(pdf_path: str) -> dict:
             r'([A-Z]+-[\w-]+):\s*(.+?sq\.\s*in\w*\.)\s*([\d\s/-]+)"?\s*(?:x|")\s*([\d\s/-]+)"?',
             text, re.IGNORECASE
         )
-    if not item_match:
-        raise ValueError(f"Could not find item/dimension line in {pdf_path}. Raw text:\n{text}")
-
-    sku, item_name, raw_w, raw_h = item_match.groups()
-    prefix_match = SKU_PREFIX_RE.match(sku)
-    sku_prefix = prefix_match.group(1) if prefix_match else sku.split("-")[0]
+    if item_match:
+        sku, item_name, raw_w, raw_h = item_match.groups()
+        prefix_match = SKU_PREFIX_RE.match(sku)
+        sku_prefix = prefix_match.group(1) if prefix_match else sku.split("-")[0]
+        item_name = item_name.strip()
+        raw_width_in = inches_to_decimal(raw_w)
+        raw_height_in = inches_to_decimal(raw_h)
+    else:
+        # A genuinely new/unrecognized product line (e.g. "CUSTOM VANITY
+        # VESSEL: Custom Vanity Vessel- 15" x 23" x 6-1/2"") doesn't follow
+        # the "SKU-CODE: name (WxH)" format every other product's production
+        # order uses -- no SKU code at all, and dimensions can be W x L x T
+        # instead of just W x H. Rather than blocking the whole order over
+        # it (po_number/so_number above already parsed fine), leave these
+        # blank so the caller can still use the order for manual-only markup
+        # (no calibrated profile, but the order form background loads and
+        # notes/cut-line are still available -- see
+        # InteractiveLayout.load_background_only() in app.py).
+        sku = item_name = sku_prefix = None
+        raw_width_in = raw_height_in = None
 
     return {
         "po_number": po_number,
@@ -904,9 +918,9 @@ def parse_production_order(pdf_path: str) -> dict:
         "so_number": so_number,
         "sku": sku,
         "sku_prefix": sku_prefix,
-        "item_name": item_name.strip(),
-        "raw_width_in": inches_to_decimal(raw_w),
-        "raw_height_in": inches_to_decimal(raw_h),
+        "item_name": item_name,
+        "raw_width_in": raw_width_in,
+        "raw_height_in": raw_height_in,
     }
 
 
@@ -980,6 +994,29 @@ def make_cut_line_items() -> list:
         "fixed_cover": None, "moved": True, "deletable": True, "editable_text": True,
     }
     return [line, label]
+
+
+_diagonal_counter = [0]
+
+
+def make_diagonal_line_item() -> dict:
+    """A manual, solid indicator line -- for flagging a diagonal cut or
+    angled feature on the drawing that isn't itself a real dimension. Unlike
+    the dashed cut-for-shipping line above, this is purely a visual marker:
+    it never bumps the oversize width/height, isn't tied to any particular
+    product line (linear or not), and multiple can exist (like notes) since
+    each gets its own counter-based key. Starts at a plain 45-degree angle;
+    draggable as a whole like any other item, and rotatable in 45-degree
+    steps in the live editor (right-click -> Rotate 45°) via the same
+    rotate_point() mechanism as the origin bracket's neo-angle step."""
+    _diagonal_counter[0] += 1
+    cx, cy = PAGE_W / 2, PAGE_H / 2
+    half = 100.0
+    return {
+        "key": f"diagonal_{_diagonal_counter[0]}", "kind": "line",
+        "x0": cx - half, "y0": cy - half, "x1": cx + half, "y1": cy + half,
+        "color": "orange", "line_width": 8.0, "dashed": False, "deletable": True,
+    }
 
 
 _note_counter = [0]
@@ -1174,13 +1211,19 @@ def _content_bbox(profile: dict, material: str, items: list, wide_origin: bool,
         min_x, min_y = min(min_x, x), min(min_y, y)
         max_x, max_y = max(max_x, x), max(max_y, y)
 
-    bx0, by0, bx1, by1 = _material_bar_rect(profile, material, bar_offset)
-    extend(bx0, by0)
-    extend(bx1, by1)
+    # profile is None for a product with no calibrated layout yet (see
+    # render_page()'s docstring) -- the material bar and origin bracket both
+    # come entirely from calibrated profile coordinates, so there's nothing
+    # to place/measure for either without one; only the manual items
+    # (notes, cut line) contribute to the bbox in that case.
+    if profile is not None:
+        bx0, by0, bx1, by1 = _material_bar_rect(profile, material, bar_offset)
+        extend(bx0, by0)
+        extend(bx1, by1)
 
-    for bracket in brackets:
-        for px, py in _bracket_points(profile, wide_origin, bracket["offset"], bracket["rotation"]):
-            extend(px, py)
+        for bracket in brackets:
+            for px, py in _bracket_points(profile, wide_origin, bracket["offset"], bracket["rotation"]):
+                extend(px, py)
 
     for item in items:
         if item["kind"] == "line":
@@ -1235,29 +1278,33 @@ def render_page(profile: dict, material: str, items: list, wide_origin: bool = F
     buf = io.BytesIO()
     c = canvas.Canvas(buf, pagesize=(page_w, page_h))
 
-    # material bar, color derived from the material name (always automatic).
+    # material bar, color derived from the material name (always automatic,
+    # but only for a product with a calibrated bar position -- profile is
+    # None for one that doesn't have a layout yet, in which case the
+    # material name isn't drawn at all here; note it manually instead).
     # Width is sized to fit whatever material text is actually entered
     # (with padding), not just the one calibrated example -- a longer name
     # (e.g. "GRAY TRAVELER") would otherwise overflow past a fixed-width bar
     # as invisible white-on-white text past its right edge.
-    bar_color = resolve_bar_color(material)
-    text_color = resolve_text_color(bar_color)
-    bx0, by0, bx1, by1 = _material_bar_rect(profile, material, bar_offset)
-    bx0, by0, bx1, by1 = bx0 + off_x, by0 + off_y, bx1 + off_x, by1 + off_y
-    fsize_material = profile["font_size_material"]
-    label_text = material.upper()
-    c.setFillColor(bar_color)
-    c.rect(bx0, by0, bx1 - bx0, by1 - by0, stroke=0, fill=1)  # square corners, no pill/stadium shape
-    c.setFillColor(text_color)
-    c.setFont("Helvetica-Bold", fsize_material)
-    mx, _my = profile["material_text_pos"]
-    bdx, _bdy = bar_offset
-    mx += bdx + off_x
-    # Center the text vertically within the bar itself (rather than trusting
-    # the originally-calibrated y position), so it always sits on the bar
-    # regardless of small calibration drift.
-    baseline_y = (by0 + by1) / 2 - fsize_material * 0.35
-    c.drawString(mx, baseline_y, label_text)
+    if profile is not None:
+        bar_color = resolve_bar_color(material)
+        text_color = resolve_text_color(bar_color)
+        bx0, by0, bx1, by1 = _material_bar_rect(profile, material, bar_offset)
+        bx0, by0, bx1, by1 = bx0 + off_x, by0 + off_y, bx1 + off_x, by1 + off_y
+        fsize_material = profile["font_size_material"]
+        label_text = material.upper()
+        c.setFillColor(bar_color)
+        c.rect(bx0, by0, bx1 - bx0, by1 - by0, stroke=0, fill=1)  # square corners, no pill/stadium shape
+        c.setFillColor(text_color)
+        c.setFont("Helvetica-Bold", fsize_material)
+        mx, _my = profile["material_text_pos"]
+        bdx, _bdy = bar_offset
+        mx += bdx + off_x
+        # Center the text vertically within the bar itself (rather than trusting
+        # the originally-calibrated y position), so it always sits on the bar
+        # regardless of small calibration drift.
+        baseline_y = (by0 + by1) / 2 - fsize_material * 0.35
+        c.drawString(mx, baseline_y, label_text)
 
     # draggable items
     for item in items:
@@ -1297,16 +1344,19 @@ def render_page(profile: dict, material: str, items: list, wide_origin: bool = F
     # but draggable, rotatable, and duplicable in the app's live editor when
     # a calibrated position turns out to be wrong or an order needs more
     # than one reference point; each bracket's offset is (0, 0) and rotation
-    # is 0 unless the user has manually adjusted it there.
-    for bracket in brackets:
-        pts = _bracket_points(profile, wide_origin, bracket["offset"], bracket["rotation"])
-        c.setStrokeColor(ORANGE)
-        c.setLineWidth(profile["bracket_width"])
-        p = c.beginPath()
-        p.moveTo(pts[0][0] + off_x, pts[0][1] + off_y)
-        for pt in pts[1:]:
-            p.lineTo(pt[0] + off_x, pt[1] + off_y)
-        c.drawPath(p, stroke=1, fill=0)
+    # is 0 unless the user has manually adjusted it there. Skipped entirely
+    # without a profile -- there's no calibrated corner to mark yet, and
+    # this is a safety-critical CNC reference point, not something to guess.
+    if profile is not None:
+        for bracket in brackets:
+            pts = _bracket_points(profile, wide_origin, bracket["offset"], bracket["rotation"])
+            c.setStrokeColor(ORANGE)
+            c.setLineWidth(profile["bracket_width"])
+            p = c.beginPath()
+            p.moveTo(pts[0][0] + off_x, pts[0][1] + off_y)
+            for pt in pts[1:]:
+                p.lineTo(pt[0] + off_x, pt[1] + off_y)
+            c.drawPath(p, stroke=1, fill=0)
 
     c.save()
     buf.seek(0)
