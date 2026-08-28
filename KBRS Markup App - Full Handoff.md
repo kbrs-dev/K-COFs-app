@@ -331,3 +331,47 @@ top-left coordinate, unchanged since 2026-07-24. That one can't be closed out wi
 confirmed bottom-left CLTB example from the user (a finished drag+rotate result or PDF), same
 constraint as before — flagged back to the user rather than guessing at a safety-critical CNC
 coordinate.
+
+**2026-08-28:** User reported "Add note" silently doing nothing on a real Custom Vanity Vessel
+order (production order PO248604 / SO244467, order form for KBRS's new "Point Drain Vanity Vessel
+(PDV-301)" line — a genuinely new product with zero PROFILES entry and no git history anywhere in
+this repo; confirmed there's no "CVV" support that was ever added or pushed here, contrary to the
+user's expectation that it already existed). Root-caused to two compounding issues:
+1. `parse_production_order()` raised a hard `ValueError` for this production order's item line
+   ("CUSTOM VANITY VESSEL: Custom Vanity Vessel- 15\" x 23\" x 6-1/2\"") since it doesn't follow the
+   "SKU-CODE: name (WxH)" format every other product's production order uses (no SKU code, and
+   three dimensions instead of two) — losing even the po_number/so_number the function had already
+   read, and blocking the order from loading at all in the app.
+2. Even with that fixed, `InteractiveLayout.load_background_only()` (the fallback path that shows
+   the order form when no profile can be resolved) explicitly sets `self.loaded = False`, and
+   `add_note()`/`toggle_cut_line()` were gated on that same flag — so the background loaded fine,
+   but the toolbar buttons for the app's only manual-annotation tools silently no-op'd, with nothing
+   telling the user why.
+
+Fixed both, plus made Generate itself support this "manual-only" mode end-to-end rather than
+hard-blocking with "Unknown product": `parse_production_order()` now returns partial data (still
+reading po_number/so_number/order_date normally) instead of raising when the item/dimension line
+doesn't match the expected format; a new `has_background` flag (separate from `loaded`, which still
+means "profile-based, matches()/get_items() are meaningful") gates the manual tools; and
+`render_page()`/`_content_bbox()` in the engine skip the material-bar and origin-bracket drawing
+entirely when `profile is None` (both are safety-critical calibrated-CNC-coordinate features with
+nothing to guess from for an uncalibrated product) while still drawing whatever manual notes/cut-
+line items exist. `_validate_and_prepare()`/`generate()` now produce a real merged PDF in this case
+instead of refusing, with the status line explicitly flagging "no calibrated layout... manual-only"
+so it's never mistaken for a fully-calibrated export. Verified end-to-end headlessly against the
+user's actual PO248604 + vanity order form files (parse → render_page(profile=None) → merge_pdf →
+confirmed 2 pages, page 2 rotated 90°, note text rendered, no material bar/bracket drawn) since the
+sandbox has no tkinter to run the live GUI itself — same testing constraint as always for this repo,
+see §2. README updated with a new section explaining this manual-only mode.
+
+**Still open from this session:** the user's third request — "I don't need the diagonal line for all
+vanities only for linear, so it should be optional to remove" — wasn't implemented. Searched this
+entire repo (code + full git history) for any existing "diagonal line" concept and found none: the
+cut-for-shipping line only ever runs vertical/horizontal (never diagonal), the origin bracket is an
+elbow/L-shape with an optional 45°-rotate step for neo-angle showers (not a plain diagonal line),
+and the diagonal cross pattern visible on the vanity order form itself is baked into the customer's
+own PDF template (the "SUMP (SLOPED AREA)" diagram), not something this app draws — so there's no
+existing feature to make optional. Given this is a production/CNC-adjacent app where guessing wrong
+means a wrong physical cut, asked the user to clarify exactly what "the diagonal line" refers to
+before implementing anything, rather than guess at a new geometry feature. Get that answer and
+implement it as the next step.

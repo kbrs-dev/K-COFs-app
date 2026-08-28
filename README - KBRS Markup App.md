@@ -135,6 +135,22 @@ Five product lines, each calibrated from one real finished example:
 | CTB | Custom Tile-Basin (point drain) | No calibrated spot yet — will warn if entered | Yes |
 | CFSRC | Custom Flanged SRC | Yes, always 1.5" per KBRS (type it in — no auto-fill) | No |
 
+## A brand new product line with no calibrated layout yet (e.g. Vanity Vessels)
+
+Load an order form + production order for a product that isn't one of the
+five above (or whose production order doesn't even follow the usual
+"SKU-CODE: name (WxH)" text format, like a Custom Vanity Vessel) and the app
+still loads the order form as the background — it just skips the automatic
+material bar, origin bracket, and dimension callouts, since there's no
+calibrated position for any of them yet. **Add note** and **Add cut-for-shipping
+line** still work in this mode (neither needs a calibrated position), so you
+can mark up the order entirely by hand — drag notes wherever they need to go,
+type in the measurements/material/whatever else the order needs. Clicking
+**Generate** bakes exactly what's in the preview onto the order form, and the
+status line flags that it was manual-only so it's never mistaken for a fully
+calibrated export. Send a sample blank order form + a finished markup for the
+product and I'll add it as a real calibrated profile.
+
 Thickness works on any product with a calibrated position; default is always
 blank (nothing shown unless you type something in). To add a thickness spot
 for CSS/CTB, or a whole new product line, send a sample order form + finished
