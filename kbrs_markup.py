@@ -987,6 +987,7 @@ def make_cut_line_items() -> list:
         "key": "cut_line", "kind": "line", "orientation": "vertical",
         "x0": PAGE_W / 2, "y0": 240.0, "x1": PAGE_W / 2, "y1": 540.0,
         "color": "orange", "line_width": 10.0, "dashed": True, "deletable": True,
+        "endpoint_handles": True,
     }
     label = {
         "key": "cut_label", "kind": "text", "text": "Cut for\nshipping",
@@ -1008,7 +1009,10 @@ def make_diagonal_line_item() -> dict:
     each gets its own counter-based key. Starts at a plain 45-degree angle;
     draggable as a whole like any other item, and rotatable in 45-degree
     steps in the live editor (right-click -> Rotate 45°) via the same
-    rotate_point() mechanism as the origin bracket's neo-angle step."""
+    rotate_point() mechanism as the origin bracket's neo-angle step. Each
+    endpoint also has its own drag handle (like the cut-for-shipping line),
+    so its length/exact angle can be adjusted freely too, not just rotated
+    in 45-degree steps."""
     _diagonal_counter[0] += 1
     cx, cy = PAGE_W / 2, PAGE_H / 2
     half = 100.0
@@ -1016,6 +1020,7 @@ def make_diagonal_line_item() -> dict:
         "key": f"diagonal_{_diagonal_counter[0]}", "kind": "line",
         "x0": cx - half, "y0": cy - half, "x1": cx + half, "y1": cy + half,
         "color": "orange", "line_width": 8.0, "dashed": False, "deletable": True,
+        "endpoint_handles": True,
     }
 
 
@@ -1168,11 +1173,23 @@ def rotate_overlay_for_page(profile: dict, wide_origin: bool, items: list, brack
     return new_items, new_brackets
 
 
+# Fallback material-bar position/size for a product with no calibrated
+# PROFILES entry (e.g. Custom Vanity Vessel) -- reuses CLSS's real calibrated
+# spot as a reasonable bottom-left default, since the Traveler name is purely
+# informational (not a CNC-critical measurement like the dimension callouts
+# or origin bracket, which are never drawn without real calibration -- see
+# render_page()). Fully draggable in the live editor like any calibrated
+# bar, so a wrong guess here just needs a drag to fix, not a wrong cut.
+DEFAULT_MATERIAL_BAR = (25.9, 43.85, 220.4, 73.85)
+DEFAULT_MATERIAL_TEXT_X = 38.9
+DEFAULT_FONT_SIZE_MATERIAL = 24
+
+
 def _material_bar_rect(profile: dict, material: str, bar_offset: tuple) -> tuple:
-    bx0, by0, bx1, by1 = profile["material_bar"]
+    bx0, by0, bx1, by1 = profile["material_bar"] if profile else DEFAULT_MATERIAL_BAR
     bdx, bdy = bar_offset
     bx0, by0, bx1, by1 = bx0 + bdx, by0 + bdy, bx1 + bdx, by1 + bdy
-    fsize_material = profile["font_size_material"]
+    fsize_material = profile["font_size_material"] if profile else DEFAULT_FONT_SIZE_MATERIAL
     text_w = stringWidth(material.upper(), "Helvetica-Bold", fsize_material)
     bar_w = max(bx1 - bx0, text_w + 10 * 2)
     return bx0, by0, bx0 + bar_w, by1
@@ -1211,16 +1228,17 @@ def _content_bbox(profile: dict, material: str, items: list, wide_origin: bool,
         min_x, min_y = min(min_x, x), min(min_y, y)
         max_x, max_y = max(max_x, x), max(max_y, y)
 
-    # profile is None for a product with no calibrated layout yet (see
-    # render_page()'s docstring) -- the material bar and origin bracket both
-    # come entirely from calibrated profile coordinates, so there's nothing
-    # to place/measure for either without one; only the manual items
-    # (notes, cut line) contribute to the bbox in that case.
-    if profile is not None:
-        bx0, by0, bx1, by1 = _material_bar_rect(profile, material, bar_offset)
-        extend(bx0, by0)
-        extend(bx1, by1)
+    # The material bar always contributes (falls back to a reasonable
+    # default position/size without a profile -- see _material_bar_rect()).
+    # The origin bracket is different: it's a safety-critical CNC reference
+    # point with nothing sane to default to, so it's skipped entirely
+    # without a profile (see render_page()'s docstring) -- only the manual
+    # items (notes, cut/diagonal lines) and the bar contribute in that case.
+    bx0, by0, bx1, by1 = _material_bar_rect(profile, material, bar_offset)
+    extend(bx0, by0)
+    extend(bx1, by1)
 
+    if profile is not None:
         for bracket in brackets:
             for px, py in _bracket_points(profile, wide_origin, bracket["offset"], bracket["rotation"]):
                 extend(px, py)
@@ -1278,33 +1296,35 @@ def render_page(profile: dict, material: str, items: list, wide_origin: bool = F
     buf = io.BytesIO()
     c = canvas.Canvas(buf, pagesize=(page_w, page_h))
 
-    # material bar, color derived from the material name (always automatic,
-    # but only for a product with a calibrated bar position -- profile is
-    # None for one that doesn't have a layout yet, in which case the
-    # material name isn't drawn at all here; note it manually instead).
-    # Width is sized to fit whatever material text is actually entered
-    # (with padding), not just the one calibrated example -- a longer name
-    # (e.g. "GRAY TRAVELER") would otherwise overflow past a fixed-width bar
-    # as invisible white-on-white text past its right edge.
-    if profile is not None:
-        bar_color = resolve_bar_color(material)
-        text_color = resolve_text_color(bar_color)
-        bx0, by0, bx1, by1 = _material_bar_rect(profile, material, bar_offset)
-        bx0, by0, bx1, by1 = bx0 + off_x, by0 + off_y, bx1 + off_x, by1 + off_y
-        fsize_material = profile["font_size_material"]
-        label_text = material.upper()
-        c.setFillColor(bar_color)
-        c.rect(bx0, by0, bx1 - bx0, by1 - by0, stroke=0, fill=1)  # square corners, no pill/stadium shape
-        c.setFillColor(text_color)
-        c.setFont("Helvetica-Bold", fsize_material)
-        mx, _my = profile["material_text_pos"]
-        bdx, _bdy = bar_offset
-        mx += bdx + off_x
-        # Center the text vertically within the bar itself (rather than trusting
-        # the originally-calibrated y position), so it always sits on the bar
-        # regardless of small calibration drift.
-        baseline_y = (by0 + by1) / 2 - fsize_material * 0.35
-        c.drawString(mx, baseline_y, label_text)
+    # material bar, color derived from the material name -- always automatic,
+    # even for a product with no calibrated layout yet (falls back to
+    # DEFAULT_MATERIAL_BAR/DEFAULT_MATERIAL_TEXT_X/DEFAULT_FONT_SIZE_MATERIAL
+    # -- see _material_bar_rect()). Unlike the dimension callouts and origin
+    # bracket below, the Traveler name isn't a CNC-critical measurement, so a
+    # reasonable default here (fully draggable, same as a calibrated one) is
+    # worth having rather than forcing a manual note for every uncalibrated
+    # product. Width is sized to fit whatever material text is actually
+    # entered (with padding), not just one calibrated example -- a longer
+    # name (e.g. "GRAY TRAVELER") would otherwise overflow past a fixed-width
+    # bar as invisible white-on-white text past its right edge.
+    bar_color = resolve_bar_color(material)
+    text_color = resolve_text_color(bar_color)
+    bx0, by0, bx1, by1 = _material_bar_rect(profile, material, bar_offset)
+    bx0, by0, bx1, by1 = bx0 + off_x, by0 + off_y, bx1 + off_x, by1 + off_y
+    fsize_material = profile["font_size_material"] if profile else DEFAULT_FONT_SIZE_MATERIAL
+    label_text = material.upper()
+    c.setFillColor(bar_color)
+    c.rect(bx0, by0, bx1 - bx0, by1 - by0, stroke=0, fill=1)  # square corners, no pill/stadium shape
+    c.setFillColor(text_color)
+    c.setFont("Helvetica-Bold", fsize_material)
+    mx = profile["material_text_pos"][0] if profile else DEFAULT_MATERIAL_TEXT_X
+    bdx, _bdy = bar_offset
+    mx += bdx + off_x
+    # Center the text vertically within the bar itself (rather than trusting
+    # the originally-calibrated y position), so it always sits on the bar
+    # regardless of small calibration drift.
+    baseline_y = (by0 + by1) / 2 - fsize_material * 0.35
+    c.drawString(mx, baseline_y, label_text)
 
     # draggable items
     for item in items:
