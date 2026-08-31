@@ -638,12 +638,23 @@ class InteractiveLayout(ttk.Frame):
             "bg_scale": self.bg_scale,
         }
 
-    def sync(self, material, oversize_w, oversize_h, thickness, wide_origin, keyhole_linear=False):
-        """Same order, just a material/thickness/curb-depth field changed --
-        update text and the material bar/bracket without touching anything
-        the user has manually dragged, edited, or undo history."""
+    def sync(self, profile, material, oversize_w, oversize_h, thickness, wide_origin, keyhole_linear=False):
+        """Same order, just a field changed (material/thickness/curb-depth,
+        or -- crucially -- the Product Type override switching between two
+        different calibrated profiles, e.g. SRC-D3 to SRC-D1) -- update text
+        and the material bar/bracket without touching anything the user has
+        manually dragged, edited, or undo history.
+
+        profile must be re-applied here, not just used by the caller to
+        decide oversize_w/oversize_h: this used to only ever get set in
+        load_new_order(), so switching the override while the same order
+        form/production order stayed loaded left self.profile silently
+        stale -- _sync_flange_note()/_sync_pilot_hole_note() kept reading
+        the OLD profile's auto_note, so e.g. picking SRC-D1 right after
+        SRC-D3 never auto-removed the flange note SRC-D3 had added."""
         if not self.loaded:
             return
+        self.profile = profile
         self.material = material
         self.wide_origin = wide_origin
         extra_w, extra_h = self._cut_line_bump()
@@ -1876,7 +1887,7 @@ class SingleOrderTab(ttk.Frame):
             self._pending_restore_state = None
             self._loaded_signature = sig if ok else None
         else:
-            self.layout.sync(material, oversize_w, oversize_h, thickness, bool(wide_origin),
+            self.layout.sync(profile, material, oversize_w, oversize_h, thickness, bool(wide_origin),
                               keyhole_linear=self.keyhole_linear.get())
 
     def pick_order_form(self):
