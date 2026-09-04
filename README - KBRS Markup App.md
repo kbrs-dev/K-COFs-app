@@ -135,6 +135,19 @@ loads an order, every dimension/thickness label is draggable right there:
 - **Generate** (left panel) bakes whatever's currently shown in the preview
   into the final PDF.
 
+**Auto-shrink-to-fit:** the material bar (and anything else) can be dragged
+anywhere, including below or beside the drawing — but the drawing normally
+fills the whole page, so dragging something below it would otherwise push
+it past the actual edge of the physical page, where it simply can't print.
+Generate checks for this automatically: if anything ends up outside the
+real printable page, the whole page's content (the drawing itself and
+every item on it, together, so they stay lined up with each other) is
+shrunk down just enough to make room and fit it back in — the status line
+after Generate says so and by how much when this happens. It's a rare
+case in practice (only when something is deliberately dragged well outside
+the drawing's normal area), and doesn't need any action from you — just
+check the result looks right, same as any manual drag.
+
 The origin bracket's default position is still rule-driven (see below) —
 dragging it is a manual override for a specific order, not a change to the
 underlying rule. Use it when an order's real drain layout doesn't match the
