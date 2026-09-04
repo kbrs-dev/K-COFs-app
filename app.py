@@ -242,6 +242,7 @@ class InteractiveLayout(ttk.Frame):
         self._page2_photo = None
         self.bg_rotation = 0  # manual rotation of the customer drawing itself (0/90/180/270)
         self.bg_scale = 1.0  # manual resize of the customer drawing itself
+        self.bg_contrast = 1.0  # manual contrast boost for a faint scan/CAD export (1.0 = unchanged)
         # tracks whether the user deliberately deleted the auto-added Blue
         # Traveler flange note for this order, so _sync_flange_note() doesn't
         # just re-add it on the next field edit -- reset per order load
@@ -401,8 +402,11 @@ class InteractiveLayout(ttk.Frame):
         menu.add_command(label="Rotate drawing 90°", command=self._rotate_background)
         menu.add_command(label="Make drawing bigger (+10%)", command=lambda: self._resize_background(1.1))
         menu.add_command(label="Make drawing smaller (-10%)", command=lambda: self._resize_background(0.9))
-        if self.bg_rotation != 0 or abs(self.bg_scale - 1.0) > 0.001:
-            menu.add_command(label="Reset drawing rotation/size", command=self._reset_background_transform)
+        menu.add_command(label="Darken lines/text (+contrast)", command=lambda: self._adjust_contrast(1.3))
+        if self.bg_contrast > 1.0:
+            menu.add_command(label="Lighten back up (-contrast)", command=lambda: self._adjust_contrast(1 / 1.3))
+        if self.bg_rotation != 0 or abs(self.bg_scale - 1.0) > 0.001 or abs(self.bg_contrast - 1.0) > 0.001:
+            menu.add_command(label="Reset drawing rotation/size/contrast", command=self._reset_background_transform)
         menu.tk_popup(event.x_root, event.y_root)
 
     def _reload_background(self):
@@ -425,9 +429,17 @@ class InteractiveLayout(ttk.Frame):
         self.bg_scale = max(0.3, min(3.0, self.bg_scale * factor))
         self._reload_background()
 
+    def _adjust_contrast(self, factor):
+        # Only ever darkens (contrast >= 1.0) -- a faint Aspire/CAD PDF
+        # export or washed-out scan needs MORE contrast to make its lines/
+        # text readable, never less; capped well short of posterizing.
+        self.bg_contrast = max(1.0, min(5.0, self.bg_contrast * factor))
+        self._reload_background()
+
     def _reset_background_transform(self):
         self.bg_rotation = 0
         self.bg_scale = 1.0
+        self.bg_contrast = 1.0
         self._reload_background()
 
     def _draw_page2(self):
@@ -490,10 +502,11 @@ class InteractiveLayout(ttk.Frame):
     # -- loading ---------------------------------------------------------------
     def _render_background(self, order_form_path):
         """Render order_form_path (through get_transformed_order_form(), so
-        any manual rotate/resize the user applied to the drawing is
+        any manual rotate/resize/contrast the user applied to the drawing is
         included) to a PIL image, plus its real page size. Shared by the
         two load_* methods and _reload_background()."""
-        transformed_path = engine.get_transformed_order_form(order_form_path, self.bg_rotation, self.bg_scale)
+        transformed_path = engine.get_transformed_order_form(
+            order_form_path, self.bg_rotation, self.bg_scale, self.bg_contrast)
         pdf = pdfium.PdfDocument(transformed_path)
         page = pdf[0]
         real_page_w, real_page_h = page.get_size()
@@ -521,6 +534,9 @@ class InteractiveLayout(ttk.Frame):
         the manually-added notes/lines and start from a blank order form."""
         self.bg_rotation = restore_state["bg_rotation"] if restore_state else 0
         self.bg_scale = restore_state["bg_scale"] if restore_state else 1.0
+        # .get() with a default -- an older saved Recent Orders entry from
+        # before this field existed won't have it at all.
+        self.bg_contrast = restore_state.get("bg_contrast", 1.0) if restore_state else 1.0
         try:
             pil_img, real_page_w, real_page_h = self._render_background(order_form_path)
         except Exception as e:
@@ -563,6 +579,9 @@ class InteractiveLayout(ttk.Frame):
         in which case the previously saved markup is put back instead."""
         self.bg_rotation = restore_state["bg_rotation"] if restore_state else 0
         self.bg_scale = restore_state["bg_scale"] if restore_state else 1.0
+        # .get() with a default -- an older saved Recent Orders entry from
+        # before this field existed won't have it at all.
+        self.bg_contrast = restore_state.get("bg_contrast", 1.0) if restore_state else 1.0
         try:
             pil_img, real_page_w, real_page_h = self._render_background(order_form_path)
         except Exception as e:
@@ -636,6 +655,7 @@ class InteractiveLayout(ttk.Frame):
             "has_cut_line": self.has_cut_line,
             "bg_rotation": self.bg_rotation,
             "bg_scale": self.bg_scale,
+            "bg_contrast": self.bg_contrast,
         }
 
     def sync(self, profile, material, oversize_w, oversize_h, thickness, wide_origin, keyhole_linear=False):
@@ -2165,6 +2185,7 @@ class SingleOrderTab(ttk.Frame):
             "has_cut_line": layout_state.get("has_cut_line", False),
             "bg_rotation": layout_state.get("bg_rotation", 0),
             "bg_scale": layout_state.get("bg_scale", 1.0),
+            "bg_contrast": layout_state.get("bg_contrast", 1.0),
         }
         # force a full reload through load_new_order() (rather than the
         # lighter sync() path) even if these happen to be the same two files
@@ -2262,8 +2283,9 @@ class SingleOrderTab(ttk.Frame):
         self.update_idletasks()
 
         # Always normalized to a portrait PAGE_W x PAGE_H page (see
-        # normalize_to_portrait_page()) even with no manual rotate/resize --
-        # only overridden below if bg_rotation/bg_scale add something on top.
+        # normalize_to_portrait_page()) even with no manual rotate/resize/
+        # contrast -- only overridden below if bg_rotation/bg_scale/
+        # bg_contrast add something on top.
         order_form_for_merge = engine.get_transformed_order_form(ctx["order_form"])
         if ctx["profile"] is None:
             # Manual-only mode (see _validate_and_prepare()'s profile_warning) --
@@ -2278,9 +2300,10 @@ class SingleOrderTab(ttk.Frame):
             brackets = []  # not drawn without a profile anyway -- see render_page()
             bar_offset = self.layout.get_bar_offset()  # bar is still draggable in manual mode -- see sync_material()
             page_rotation = self.layout.bg_rotation
-            if self.layout.bg_rotation or abs(self.layout.bg_scale - 1.0) > 0.001:
+            if (self.layout.bg_rotation or abs(self.layout.bg_scale - 1.0) > 0.001
+                    or abs(self.layout.bg_contrast - 1.0) > 0.001):
                 order_form_for_merge = engine.get_transformed_order_form(
-                    ctx["order_form"], self.layout.bg_rotation, self.layout.bg_scale)
+                    ctx["order_form"], self.layout.bg_rotation, self.layout.bg_scale, self.layout.bg_contrast)
             if page_rotation:
                 items, brackets = engine.rotate_overlay_for_page(None, False, items, brackets, page_rotation)
         else:
@@ -2295,9 +2318,10 @@ class SingleOrderTab(ttk.Frame):
                 brackets = self.layout.get_brackets()  # manual nudge(s)/rotation(s) from the live preview, if any
                 bar_offset = self.layout.get_bar_offset()  # manual nudge for the Traveler bar, if any
                 page_rotation = self.layout.bg_rotation
-                if self.layout.bg_rotation or abs(self.layout.bg_scale - 1.0) > 0.001:
+                if (self.layout.bg_rotation or abs(self.layout.bg_scale - 1.0) > 0.001
+                        or abs(self.layout.bg_contrast - 1.0) > 0.001):
                     order_form_for_merge = engine.get_transformed_order_form(
-                        ctx["order_form"], self.layout.bg_rotation, self.layout.bg_scale)
+                        ctx["order_form"], self.layout.bg_rotation, self.layout.bg_scale, self.layout.bg_contrast)
                 if self.layout.bg_rotation:
                     # Rotating the background swaps its width/height -- without
                     # also rotating the overlay's own coordinates to match,
@@ -2355,6 +2379,7 @@ class SingleOrderTab(ttk.Frame):
                     "has_cut_line": self.layout.has_cut_line if matches else False,
                     "bg_rotation": self.layout.bg_rotation if matches else 0,
                     "bg_scale": self.layout.bg_scale if matches else 1.0,
+                    "bg_contrast": self.layout.bg_contrast if matches else 1.0,
                 },
             }
             engine.save_recent_order(recent_entry)
