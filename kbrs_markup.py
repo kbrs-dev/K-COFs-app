@@ -621,14 +621,18 @@ def normalize_to_portrait_page(order_form_path: str) -> str:
     return out_path
 
 
-def get_transformed_order_form(order_form_path: str, rotation: int = 0, scale: float = 1.0) -> str:
+def get_transformed_order_form(order_form_path: str, rotation: int = 0, scale: float = 1.0,
+                                contrast: float = 1.0) -> str:
     """A version of the order-form PDF -- already normalized to a portrait
     PAGE_W x PAGE_H page by normalize_to_portrait_page() -- with an
-    additional user-requested rotation (0/90/180/270) and scale (1.0 =
-    unchanged) applied on top, for reorienting/resizing a drawing that's
-    still awkward after the automatic normalization. Cached by
-    path+mtime+rotation+scale. Returns the plain normalized path unchanged
-    if rotation is 0 and scale is 1.0 (the default, by far the common case).
+    additional user-requested rotation (0/90/180/270), scale (1.0 =
+    unchanged), and contrast (1.0 = unchanged; >1.0 darkens lines/text
+    against the background, for a faint CAD/CAM export like Aspire's PDF
+    output or a washed-out scan) applied on top, for reorienting/resizing/
+    darkening a drawing that's still awkward after the automatic
+    normalization. Cached by path+mtime+rotation+scale+contrast. Returns the
+    plain normalized path unchanged if all three are at their defaults (by
+    far the common case).
 
     Implemented by rendering the page to a high-resolution image and
     re-wrapping that at the transformed size (same approach ensure_pdf()
@@ -636,21 +640,28 @@ def get_transformed_order_form(order_form_path: str, rotation: int = 0, scale: f
     page's /Rotate flag doesn't change its underlying raw content
     coordinate space, and merge_pdf()'s overlay compositing operates in
     that raw space, so a metadata-only rotation would leave the overlay
-    landing in the wrong place relative to the visibly-rotated background."""
+    landing in the wrong place relative to the visibly-rotated background.
+    Contrast is applied for the same reason it has to go through the image
+    pipeline at all: there's no PDF-content-stream equivalent of "make the
+    lines darker" for an arbitrary vector or scanned source -- only a
+    rendered image can be leveled/contrasted."""
     base_path = normalize_to_portrait_page(order_form_path)
     rotation = rotation % 360
-    if rotation == 0 and abs(scale - 1.0) < 0.001:
+    if rotation == 0 and abs(scale - 1.0) < 0.001 and abs(contrast - 1.0) < 0.001:
         return base_path
     try:
         mtime = os.path.getmtime(order_form_path)
     except OSError:
         mtime = None
-    cache_key = (order_form_path, mtime, rotation, round(scale, 3))
+    cache_key = (order_form_path, mtime, rotation, round(scale, 3), round(contrast, 3))
     cached = _BG_TRANSFORM_CACHE.get(cache_key)
     if cached and os.path.isfile(cached):
         return cached
 
     pil_img = _render_pil(base_path)
+    if abs(contrast - 1.0) >= 0.001:
+        from PIL import ImageEnhance  # local import: only needed for this rare path
+        pil_img = ImageEnhance.Contrast(pil_img).enhance(contrast)
     if rotation:
         # PIL rotates counter-clockwise for positive angles; PDF /Rotate and
         # the app's other 90-degree rotations (bracket, cut line) are
