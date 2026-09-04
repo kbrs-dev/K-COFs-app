@@ -119,6 +119,16 @@ loads an order, every dimension/thickness label is draggable right there:
   position" (clears both the drag and any rotation back to the calibrated
   default). The bracket turns pink while it's been manually adjusted, so
   it's obvious at a glance that it's off the calibrated default.
+- **Right-click the drawing itself** (not an item) for "Rotate drawing 90°",
+  "Make drawing bigger/smaller", and "Darken lines/text (+contrast)" — useful
+  for a source that's awkward after the automatic normalization, or (the
+  contrast option) a faint CAD/CAM export like Aspire's PDF output or a
+  washed-out scan where the lines and printed measurements are hard to read.
+  Contrast only ever darkens (never lightens past the original), each click
+  applies another notch, and "Reset drawing rotation/size/contrast" clears
+  all three back to normal. This is baked into the final PDF the same way a
+  rotate/resize is — it changes how the customer's drawing itself prints,
+  not just the live preview.
 - Editing here, then changing the material/thickness/curb-depth fields on
   the left, keeps your edits — only picking a *different* order form/production
   order resets the layout back to defaults.
