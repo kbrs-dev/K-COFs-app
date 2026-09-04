@@ -114,6 +114,7 @@ from reportlab.pdfgen import canvas
 from reportlab.pdfbase.pdfmetrics import stringWidth
 from reportlab.lib.colors import Color
 from reportlab.lib.utils import ImageReader
+from PIL import Image
 import io
 
 # The default measurement-overlay color ("orange" everywhere in this file)
@@ -582,6 +583,76 @@ def _darken_toward_black(pil_img, factor: float):
     return pil_img.point(lut * len(pil_img.getbands()))
 
 
+# The minimum line weight (in canonical/final-page points) a hairline
+# should still have once printed, regardless of how thin or light it
+# started out. 0.4pt is a modest, still-fine "hairline" weight (~0.14mm) --
+# thin enough not to visibly bulk up an already-fine drawing, thick enough
+# to survive anti-aliasing/downsampling instead of dissolving to invisible.
+_MIN_PRINTED_LINE_WIDTH_PT = 0.4
+# Hard cap on the thickening block size -- both to bound how long it can
+# take on a very large render, and so a pathologically tiny fit_scale (a
+# source page enormously larger than Letter) can't balloon every line into
+# a visibly thick blob instead of merely "thick enough."
+_MAX_THICKEN_BLOCK = 15
+
+
+def _thicken_thin_lines(pil_img, fit_scale: float):
+    """Grows every dark feature outward by a small radius (pixel-block
+    minimum-pooling, then nearest-neighbor upsampling back to full size --
+    see below for why not a true sliding-window min filter), so a true
+    hairline stroke survives being shrunk down to the small canonical page
+    instead of anti-aliasing away to a barely-visible light smear.
+
+    This targets a real, confirmed-by-inspection cause, not a guess: a
+    real Aspire CAM export's dimension/measurement lines use PDF line
+    width 0 -- "exactly 1 device pixel wide at whatever resolution it's
+    rasterized at," a width that does NOT scale with the page's own
+    content. On an oversized source (one real example: 2196x4374pt, i.e. a
+    30.5x60.75" real part, shrunk to fit the small canonical Letter page)
+    that 1 pixel ends up representing a small fraction of a final printed
+    point regardless of the line's color -- confirmed by forcing every
+    stroke in that exact file to pure black and finding the rendered
+    result exactly as faint as before recoloring, proving this is a width
+    problem, not a color one, so no amount of "darken lines" contrast can
+    fix it (that only pushes each pixel's existing value darker; it can't
+    make a sub-pixel-coverage line occupy more pixels).
+
+    Scaled by fit_scale (this render's own shrink ratio, computed by the
+    caller from the same source dimensions used to fit it to the canonical
+    page) so a normal Letter-ish source -- not shrunk at all -- gets
+    essentially no thickening (the common case, a no-op), while a source
+    shrunk drastically gets thickened just enough that even its thinnest
+    hairline should reach roughly _MIN_PRINTED_LINE_WIDTH_PT once printed.
+
+    Implemented as block min-pooling (reshape into blocksize x blocksize
+    tiles, take each tile's darkest pixel, upsample the result back to full
+    size with nearest-neighbor) rather than PIL's ImageFilter.MinFilter --
+    empirically, a true sliding-window min filter at the resolution this
+    runs at (a multi-thousand-pixel-per-side render) took 15-20+ seconds on
+    a real example; block-pooling is a coarser approximation (a fixed grid
+    instead of a sliding window) but visually indistinguishable for this
+    purpose -- thickening already-thin linework, not precision geometry --
+    and around 7x faster in testing against that same file."""
+    if fit_scale <= 0:
+        return pil_img
+    radius_px = (_MIN_PRINTED_LINE_WIDTH_PT / fit_scale) * _BG_RENDER_SCALE / 2
+    block = min(_MAX_THICKEN_BLOCK, int(round(radius_px)) * 2 + 1)
+    if block <= 1:
+        return pil_img
+    import numpy as np  # local import: only needed for this (rare, oversized-source) path
+    if pil_img.mode != "RGB":
+        pil_img = pil_img.convert("RGB")
+    w, h = pil_img.size
+    arr = np.asarray(pil_img)
+    pad_h, pad_w = (-h) % block, (-w) % block
+    if pad_h or pad_w:
+        arr = np.pad(arr, ((0, pad_h), (0, pad_w), (0, 0)), mode="edge")
+    h2, w2 = arr.shape[0], arr.shape[1]
+    pooled = arr.reshape(h2 // block, block, w2 // block, block, -1).min(axis=(1, 3))
+    small_img = Image.fromarray(pooled.astype(np.uint8))
+    return small_img.resize((w, h), resample=Image.NEAREST)
+
+
 def _wrap_pil_as_pdf(pil_img, page_w: float, page_h: float, offset_x: float = 0.0,
                       offset_y: float = 0.0, draw_w: float = None, draw_h: float = None) -> str:
     """Draws pil_img onto a fresh page_w x page_h PDF page at the given
@@ -596,7 +667,17 @@ def _wrap_pil_as_pdf(pil_img, page_w: float, page_h: float, offset_x: float = 0.
     return out_path
 
 
-def normalize_to_portrait_page(order_form_path: str, contrast: float = 1.0) -> str:
+def _fit_cache_key(fit: tuple):
+    """A hashable, cache-friendly stand-in for a fit tuple -- None whenever
+    fit is None or a no-op (see compute_page_fit()/_NO_FIT), so the
+    overwhelmingly common no-shrink-needed case shares its cache entry with
+    plain contrast/rotation/scale calls that never pass fit at all."""
+    if fit is None or fit[0] >= 0.999:
+        return None
+    return tuple(round(v, 3) for v in fit[:3])
+
+
+def normalize_to_portrait_page(order_form_path: str, contrast: float = 1.0, fit: tuple = None) -> str:
     """Every exported/previewed order form page is always exactly
     PAGE_W x PAGE_H (portrait Letter, 8.5x11) -- a landscape scan (common
     for long linear panels) gets rotated to portrait first; whatever's left
@@ -633,24 +714,51 @@ def normalize_to_portrait_page(order_form_path: str, contrast: float = 1.0) -> s
     for a heavily-shrunk source, visibly degrading or dropping fine
     linework. Applying contrast against the original high-resolution render
     instead avoids that second, lossy pass entirely for the common
-    contrast-only case (see get_transformed_order_form())."""
+    contrast-only case (see get_transformed_order_form()).
+
+    Also always applies _thicken_thin_lines() here, unconditionally (not
+    gated behind contrast at all -- a real hairline-width source is just as
+    faint at contrast=1.0, see that function's docstring), for the same
+    "do it against the original high-resolution render, not a later
+    downsampled one" reason.
+
+    fit (see compute_page_fit()/render_page()'s own fit parameter), when
+    not a no-op, is applied the same way and for the same reason: it
+    shrinks-and-repositions the drawing within this same first,
+    full-resolution pass rather than a later lossy re-rasterization, so
+    that "shrink the drawing to make room for an out-of-bounds item" never
+    costs the same quality a manual rotate/resize already does (see
+    get_transformed_order_form() for the one case -- a manual rotation
+    combined with an active fit -- that still needs a second pass)."""
     base_path = ensure_pdf(order_form_path)
     try:
         mtime = os.path.getmtime(order_form_path)
     except OSError:
         mtime = None
-    cache_key = (order_form_path, mtime, round(contrast, 3))
+    cache_key = (order_form_path, mtime, round(contrast, 3), _fit_cache_key(fit))
     cached = _NORMALIZED_PAGE_CACHE.get(cache_key)
     if cached and os.path.isfile(cached):
         return cached
 
     pil_img = _render_pil(base_path)
-    if abs(contrast - 1.0) >= 0.001:
-        pil_img = _darken_toward_black(pil_img, contrast)
     img_w_pts, img_h_pts = pil_img.width / _BG_RENDER_SCALE, pil_img.height / _BG_RENDER_SCALE
     fit_scale = min(PAGE_W / img_w_pts, PAGE_H / img_h_pts)
+    pil_img = _thicken_thin_lines(pil_img, fit_scale)
+    if abs(contrast - 1.0) >= 0.001:
+        pil_img = _darken_toward_black(pil_img, contrast)
     draw_w, draw_h = img_w_pts * fit_scale, img_h_pts * fit_scale
     offset_x, offset_y = (PAGE_W - draw_w) / 2, (PAGE_H - draw_h) / 2
+
+    if fit is not None and fit[0] < 0.999:
+        # Nest the normal centered/letterboxed placement inside the smaller
+        # box fit carves out of the canonical page -- e.g. anchored at the
+        # top, this leaves the drawing's own top edge exactly where it was
+        # and shrinks it upward from the bottom, freeing blank space below
+        # for whatever previously landed off the real page.
+        box_x0, box_y0 = apply_page_fit(0.0, 0.0, fit)
+        k = fit[0]
+        draw_w, draw_h = draw_w * k, draw_h * k
+        offset_x, offset_y = box_x0 + offset_x * k, box_y0 + offset_y * k
 
     out_path = _wrap_pil_as_pdf(pil_img, PAGE_W, PAGE_H, offset_x, offset_y, draw_w, draw_h)
     _NORMALIZED_PAGE_CACHE[cache_key] = out_path
@@ -658,17 +766,20 @@ def normalize_to_portrait_page(order_form_path: str, contrast: float = 1.0) -> s
 
 
 def get_transformed_order_form(order_form_path: str, rotation: int = 0, scale: float = 1.0,
-                                contrast: float = 1.0) -> str:
+                                contrast: float = 1.0, fit: tuple = None) -> str:
     """A version of the order-form PDF -- already normalized to a portrait
     PAGE_W x PAGE_H page by normalize_to_portrait_page() -- with an
     additional user-requested rotation (0/90/180/270), scale (1.0 =
-    unchanged), and contrast (1.0 = unchanged; >1.0 darkens lines/text
-    against the background, for a faint CAD/CAM export like Aspire's PDF
-    output or a washed-out scan) applied on top, for reorienting/resizing/
-    darkening a drawing that's still awkward after the automatic
-    normalization. Cached by path+mtime+rotation+scale+contrast. Returns the
-    plain normalized path unchanged if all three are at their defaults (by
-    far the common case).
+    unchanged), contrast (1.0 = unchanged; >1.0 darkens lines/text against
+    the background, for a faint CAD/CAM export like Aspire's PDF output or
+    a washed-out scan), and fit (see compute_page_fit(); None or a no-op
+    for the overwhelming majority of orders, where nothing ever landed
+    outside the real page) applied on top, for reorienting/resizing/
+    darkening/shrinking a drawing that's still awkward -- or, for fit,
+    doesn't leave room for something positioned outside it -- after the
+    automatic normalization. Cached by path+mtime+rotation+scale+contrast+
+    fit. Returns the plain normalized path unchanged if rotation/scale are
+    at their defaults and fit is a no-op (by far the common case).
 
     Implemented by rendering the page to a high-resolution image and
     re-wrapping that at the transformed size (same approach ensure_pdf()
@@ -684,25 +795,41 @@ def get_transformed_order_form(order_form_path: str, rotation: int = 0, scale: f
     lower-resolution re-rasterization of the already-normalized page) is
     what avoids visibly degrading or dropping fine linework on a source
     that's much larger than Letter (a CAM/CAD export sized to the real
-    physical part) and had to be shrunk substantially to fit. That means
-    rotation/scale are the only two things that actually need this
-    function's own second rasterization pass; a contrast-only call (by far
-    the common case for this feature) hits the fast path below and never
-    touches this lossier path at all."""
-    base_path = normalize_to_portrait_page(order_form_path, contrast)
+    physical part) and had to be shrunk substantially to fit.
+
+    fit is handled the same way, but only when rotation is 0: fit's anchor
+    logic (see compute_page_fit()) is computed in the SAME (unrotated)
+    canonical frame the overlay's coordinates use whenever page_rotation is
+    0, so it's passed straight through to normalize_to_portrait_page() and
+    baked into that first, full-resolution pass -- no extra rasterization
+    needed. When rotation is non-zero, fit has to wait for THIS function's
+    own second pass instead (applied to the rotated image, after rotating,
+    so its anchor lines up with the already-rotated overlay coordinates
+    rotate_overlay_for_page() produces) -- an accepted, pre-existing
+    quality trade-off shared with plain rotation/scale, not a new one fit
+    introduces.
+
+    That means rotation, scale, and (only when combined with a non-zero
+    rotation) fit are the things that need this function's own second
+    rasterization pass; a contrast-only or fit-only-with-no-rotation call
+    (together, by far the common case for either feature) hits the fast
+    path below and never touches this lossier path at all."""
     rotation = rotation % 360
-    if rotation == 0 and abs(scale - 1.0) < 0.001:
+    fit_active = fit is not None and fit[0] < 0.999
+    base_path = normalize_to_portrait_page(order_form_path, contrast, fit if (fit_active and rotation == 0) else None)
+    if rotation == 0 and abs(scale - 1.0) < 0.001 and not fit_active:
         return base_path
     try:
         mtime = os.path.getmtime(order_form_path)
     except OSError:
         mtime = None
-    cache_key = (order_form_path, mtime, rotation, round(scale, 3), round(contrast, 3))
+    fit_key = _fit_cache_key(fit) if (fit_active and rotation != 0) else None
+    cache_key = (order_form_path, mtime, rotation, round(scale, 3), round(contrast, 3), fit_key)
     cached = _BG_TRANSFORM_CACHE.get(cache_key)
     if cached and os.path.isfile(cached):
         return cached
 
-    pil_img = _render_pil(base_path)  # base_path already has contrast baked in, at full resolution
+    pil_img = _render_pil(base_path)  # base_path already has contrast (and, if rotation==0, fit) baked in
     if rotation:
         # PIL rotates counter-clockwise for positive angles; PDF /Rotate and
         # the app's other 90-degree rotations (bracket, cut line) are
@@ -713,7 +840,21 @@ def get_transformed_order_form(order_form_path: str, rotation: int = 0, scale: f
         pil_img = pil_img.resize(new_size)
 
     page_w, page_h = pil_img.width / _BG_RENDER_SCALE, pil_img.height / _BG_RENDER_SCALE
-    out_path = _wrap_pil_as_pdf(pil_img, page_w, page_h)
+    if fit_active and rotation != 0:
+        # The outer page stays at fit's own floor size (the fixed canonical
+        # target rotate_overlay_for_page() and the overlay's coordinates
+        # already agree on), NOT pil_img's own (rotation/scale-adjusted)
+        # size -- fit's anchor math assumes that fixed frame. Combining a
+        # manual resize (scale != 1) with both a rotation AND an active fit
+        # is a rare enough triple-stack that this is approximate rather
+        # than exact in that specific combination; rotation+fit alone
+        # (by far the more likely combination) is exact.
+        floor_w, floor_h = fit[3], fit[4]
+        box_x0, box_y0 = apply_page_fit(0.0, 0.0, fit)
+        box_x1, box_y1 = apply_page_fit(floor_w, floor_h, fit)
+        out_path = _wrap_pil_as_pdf(pil_img, floor_w, floor_h, box_x0, box_y0, box_x1 - box_x0, box_y1 - box_y0)
+    else:
+        out_path = _wrap_pil_as_pdf(pil_img, page_w, page_h)
     _BG_TRANSFORM_CACHE[cache_key] = out_path
     return out_path
 
@@ -1419,19 +1560,116 @@ def _content_bbox(profile: dict, material: str, items: list, wide_origin: bool,
     return min_x, min_y, max_x, max_y
 
 
+# A no-op fit: k=1.0 means "don't shrink anything" -- apply_page_fit() with
+# this tuple returns every coordinate unchanged. compute_page_fit() returns
+# exactly this whenever nothing actually overflows the real page (by far
+# the common case), so callers can pass its result straight through without
+# a special case for "nothing to do."
+_NO_FIT = (1.0, 0.0, 0.0, PAGE_W, PAGE_H)
+
+
+def compute_page_fit(profile: dict, material: str, items: list, wide_origin: bool = False,
+                      brackets: list = None, bar_offset: tuple = (0.0, 0.0), page_rotation: int = 0) -> tuple:
+    """If everything render_page() is about to draw already fits within the
+    real printable page, returns _NO_FIT (k=1.0, nothing to do). Otherwise
+    returns (k, anchor_x, anchor_y, floor_w, floor_h): a uniform shrink
+    factor k < 1.0 and an anchor point such that scaling every canonical
+    coordinate toward that anchor by k -- see apply_page_fit() -- brings the
+    full content bounding box back within (0,0)-(floor_w,floor_h).
+
+    This is the "shrink the drawing to make it fit" behavior for an item
+    (typically the material bar, dragged below or beside the drawing) that
+    would otherwise land outside the real page's fixed physical boundary
+    and simply never print there -- auto-grow (_content_bbox() above) only
+    resizes the overlay's OWN page, which does not help: merge_pdf() always
+    composites the overlay onto the real, fixed-size target page using the
+    canonical PAGE_W x PAGE_H -> real-page ratio, so any canonical
+    coordinate outside (0,0)-(PAGE_W,PAGE_H) (or the rotated floor) lands
+    outside the real page's own boundary too, no matter how the overlay's
+    own page was sized.
+
+    The anchor is chosen per axis, at whichever edge ISN'T overflowing (so
+    shrinking pulls the overflowing edge inward without moving content that
+    was already fine) -- e.g. content hanging below the page anchors at the
+    top and shrinks upward, freeing blank space at the bottom for it to
+    land in. Applying the SAME (k, anchor) to the background drawing itself
+    (see get_transformed_order_form()'s fit parameter) keeps the drawing
+    and every overlay item -- including a calibrated origin bracket or
+    dimension callout -- exactly aligned with each other throughout, just
+    at a slightly smaller overall size: this is a uniform scale, not an
+    independent reshuffling of drawing vs. overlay."""
+    if brackets is None:
+        brackets = _DEFAULT_BRACKETS
+    floor_w, floor_h = (PAGE_H, PAGE_W) if page_rotation % 180 == 90 else (PAGE_W, PAGE_H)
+    min_x, min_y, max_x, max_y = _content_bbox(profile, material, items, wide_origin, brackets, bar_offset,
+                                                page_rotation)
+    content_w, content_h = max_x - min_x, max_y - min_y
+    if content_w <= floor_w + 0.01 and content_h <= floor_h + 0.01:
+        return _NO_FIT
+
+    k = min(1.0,
+            floor_w / content_w if content_w > 0 else 1.0,
+            floor_h / content_h if content_h > 0 else 1.0)
+
+    left_over, right_over = min_x < -0.01, max_x > floor_w + 0.01
+    if left_over and right_over:
+        anchor_x = floor_w / 2
+    elif right_over:
+        anchor_x = 0.0
+    elif left_over:
+        anchor_x = floor_w
+    else:
+        anchor_x = 0.0
+
+    top_over, bottom_over = max_y > floor_h + 0.01, min_y < -0.01
+    if top_over and bottom_over:
+        anchor_y = floor_h / 2
+    elif bottom_over:
+        anchor_y = floor_h
+    elif top_over:
+        anchor_y = 0.0
+    else:
+        anchor_y = floor_h
+
+    return k, anchor_x, anchor_y, floor_w, floor_h
+
+
+def apply_page_fit(x: float, y: float, fit: tuple) -> tuple:
+    """Scales (x, y) toward fit's anchor by fit's k -- see
+    compute_page_fit(). A no-op when fit is _NO_FIT (or None)."""
+    if fit is None:
+        return x, y
+    k, anchor_x, anchor_y, _floor_w, _floor_h = fit
+    return anchor_x + k * (x - anchor_x), anchor_y + k * (y - anchor_y)
+
+
 def render_page(profile: dict, material: str, items: list, wide_origin: bool = False,
-                 brackets: list = None, bar_offset: tuple = (0.0, 0.0), page_rotation: int = 0) -> tuple:
+                 brackets: list = None, bar_offset: tuple = (0.0, 0.0), page_rotation: int = 0,
+                 fit: tuple = None) -> tuple:
     """Returns (pdf_bytes, min_x, min_y). min_x/min_y are the canonical
     (0,0)-(PAGE_W,PAGE_H)-space coordinates that ended up at this page's own
     local (0, 0) -- i.e. how far auto-grow (below) shifted everything by.
     merge_pdf() needs these to correctly place the overlay on the real page
     (see its docstring for why) -- pass them straight through, don't just
-    take the bytes."""
+    take the bytes.
+
+    fit: the (k, anchor_x, anchor_y, floor_w, floor_h) tuple from
+    compute_page_fit(), or None to have it computed automatically from
+    profile/material/items/wide_origin/brackets/bar_offset/page_rotation
+    (the right choice for any caller not also rendering a matching
+    background -- see get_transformed_order_form()'s own fit parameter).
+    A caller that DOES render a background to go with this overlay (the
+    live app's Generate) must compute fit once with compute_page_fit() and
+    pass the SAME value to both calls, so the drawing and every overlay
+    item shrink together and stay aligned -- computing it twice would only
+    coincidentally agree if nothing about the inputs changed in between."""
     # brackets is a list of {"offset": (dx,dy), "rotation": 0/90/180/270} --
     # some orders need more than one CNC/CAD reference point. Defaults to a
     # single un-adjusted bracket at the calibrated position.
     if brackets is None:
         brackets = _DEFAULT_BRACKETS
+    if fit is None:
+        fit = compute_page_fit(profile, material, items, wide_origin, brackets, bar_offset, page_rotation)
 
     # page_rotation only affects the auto-grow floor's shape (see
     # _content_bbox) -- callers rotating the background are expected to
@@ -1440,17 +1678,23 @@ def render_page(profile: dict, material: str, items: list, wide_origin: bool = F
     # into the wrong (unrotated) shape.
     #
     # Everything is normally within the calibrated (0,0)-(PAGE_W,PAGE_H) box,
-    # but a manually dragged bracket/bar/item can end up outside it -- size
-    # the overlay's own page to whatever actually needs to fit (never
-    # smaller than the normal page) and shift every draw call by the box's
-    # origin, so nothing is ever silently cut off. merge_pdf() then places
-    # this correctly-sized overlay onto the real target page using min_x/
-    # min_y (returned below) plus the fixed canonical->real scale ratio --
-    # NOT a scale derived from this page's own (possibly grown) size, which
-    # would silently shrink/shift everything else on the page too (the bug
-    # this whole tuple return exists to fix).
+    # but a manually dragged bracket/bar/item can end up outside it. fit
+    # (see compute_page_fit()) is applied to every coordinate below FIRST,
+    # shrinking everything back within the real page whenever that's
+    # actually needed (a no-op otherwise); the auto-grow bbox/off_x/off_y
+    # below then just acts as a safety net for any float rounding slop,
+    # sizing the overlay's own page to whatever still needs it (never
+    # smaller than the normal page) and shifting every draw call by the
+    # box's origin, so nothing is ever silently cut off. merge_pdf() then
+    # places this correctly-sized overlay onto the real target page using
+    # min_x/min_y (returned below) plus the fixed canonical->real scale
+    # ratio -- NOT a scale derived from this page's own (possibly grown)
+    # size, which would silently shrink/shift everything else on the page
+    # too (the bug this whole tuple return exists to fix).
     min_x, min_y, max_x, max_y = _content_bbox(profile, material, items, wide_origin, brackets, bar_offset,
                                                 page_rotation)
+    min_x, min_y = apply_page_fit(min_x, min_y, fit)
+    max_x, max_y = apply_page_fit(max_x, max_y, fit)
     off_x, off_y = -min_x, -min_y
     page_w, page_h = max_x - min_x, max_y - min_y
 
@@ -1471,6 +1715,8 @@ def render_page(profile: dict, material: str, items: list, wide_origin: bool = F
     bar_color = resolve_bar_color(material)
     text_color = resolve_text_color(bar_color)
     bx0, by0, bx1, by1 = _material_bar_rect(profile, material, bar_offset)
+    bx0, by0 = apply_page_fit(bx0, by0, fit)
+    bx1, by1 = apply_page_fit(bx1, by1, fit)
     bx0, by0, bx1, by1 = bx0 + off_x, by0 + off_y, bx1 + off_x, by1 + off_y
     fsize_material = profile["font_size_material"] if profile else DEFAULT_FONT_SIZE_MATERIAL
     label_text = material.upper()
@@ -1480,7 +1726,9 @@ def render_page(profile: dict, material: str, items: list, wide_origin: bool = F
     c.setFont("Helvetica-Bold", fsize_material)
     mx = profile["material_text_pos"][0] if profile else DEFAULT_MATERIAL_TEXT_X
     bdx, _bdy = bar_offset
-    mx += bdx + off_x
+    mx += bdx
+    mx, _my = apply_page_fit(mx, 0.0, fit)
+    mx += off_x
     # Center the text vertically within the bar itself (rather than trusting
     # the originally-calibrated y position), so it always sits on the bar
     # regardless of small calibration drift.
@@ -1490,13 +1738,16 @@ def render_page(profile: dict, material: str, items: list, wide_origin: bool = F
     # draggable items
     for item in items:
         if item["kind"] == "line":
+            x0, y0 = apply_page_fit(item["x0"], item["y0"], fit)
+            x1, y1 = apply_page_fit(item["x1"], item["y1"], fit)
             c.setStrokeColor(COLOR_MAP.get(item["color"], ORANGE))
             c.setLineWidth(item.get("line_width", 10.0))
             c.setDash([6, 6] if item.get("dashed") else [])
-            c.line(item["x0"] + off_x, item["y0"] + off_y, item["x1"] + off_x, item["y1"] + off_y)
+            c.line(x0 + off_x, y0 + off_y, x1 + off_x, y1 + off_y)
             c.setDash([])
         elif item["kind"] == "text":
-            ix, iy = item["x"] + off_x, item["y"] + off_y
+            ix, iy = apply_page_fit(item["x"], item["y"], fit)
+            ix, iy = ix + off_x, iy + off_y
             lines = item["text"].split("\n")
             fsize = item["font_size"]
             color = COLOR_MAP.get(item["color"], ORANGE)
@@ -1504,6 +1755,8 @@ def render_page(profile: dict, material: str, items: list, wide_origin: bool = F
             #    customer's handwritten raw measurement) when present.
             if not item.get("moved") and item.get("fixed_cover"):
                 x0, y0, x1, y1 = item["fixed_cover"]
+                x0, y0 = apply_page_fit(x0, y0, fit)
+                x1, y1 = apply_page_fit(x1, y1, fit)
                 c.setFillColor(WHITE)
                 c.rect(x0 + off_x, y0 + off_y, x1 - x0, y1 - y0, stroke=0, fill=1)
             # 2) always also paint a padded white box snug around the new
@@ -1531,6 +1784,7 @@ def render_page(profile: dict, material: str, items: list, wide_origin: bool = F
     if profile is not None:
         for bracket in brackets:
             pts = _bracket_points(profile, wide_origin, bracket["offset"], bracket["rotation"])
+            pts = [apply_page_fit(px, py, fit) for px, py in pts]
             c.setStrokeColor(ORANGE)
             c.setLineWidth(profile["bracket_width"])
             p = c.beginPath()
@@ -1547,9 +1801,15 @@ def render_page(profile: dict, material: str, items: list, wide_origin: bool = F
 def build_overlay(profile: dict, oversize_w: float, oversize_h: float, material: str,
                    thickness: str = "", wide_origin: bool = False) -> tuple:
     """Back-compat wrapper: renders the default (non-edited) item layout.
-    Returns (pdf_bytes, min_x, min_y) -- see render_page()."""
+    Returns (pdf_bytes, min_x, min_y, fit) -- see render_page(). fit is
+    almost always compute_page_fit()'s no-op _NO_FIT here: default item
+    positions are calibrated to already fit the real page, so there's
+    normally nothing to shrink for -- returned anyway so build_output() can
+    pass the exact same value on to get_transformed_order_form()."""
     items = compute_default_items(profile, oversize_w, oversize_h, thickness=thickness)
-    return render_page(profile, material, items, wide_origin=wide_origin)
+    fit = compute_page_fit(profile, material, items, wide_origin=wide_origin)
+    pdf_bytes, min_x, min_y = render_page(profile, material, items, wide_origin=wide_origin, fit=fit)
+    return pdf_bytes, min_x, min_y, fit
 
 
 def merge_pdf(order_form_pdf: str, production_order_pdf: str, overlay_bytes: bytes,
@@ -1628,12 +1888,13 @@ def build_output(order_form_pdf: str, production_order_pdf: str, material: str,
     thickness = (thickness or "").strip()
     thickness_unsupported = bool(thickness) and "thickness_text_pos" not in profile
 
-    overlay_bytes, min_x, min_y = build_overlay(profile, oversize_w, oversize_h, material,
-                                                 thickness=thickness, wide_origin=wide_origin)
+    overlay_bytes, min_x, min_y, fit = build_overlay(profile, oversize_w, oversize_h, material,
+                                                      thickness=thickness, wide_origin=wide_origin)
     # merge_pdf() expects an already-fully-transformed page (see its
     # docstring) -- the CLI has no live editor/manual rotation to apply, so
-    # this is just the plain portrait-normalized baseline.
-    normalized_order_form = get_transformed_order_form(order_form_pdf)
+    # this is just the plain portrait-normalized baseline, plus fit if the
+    # (rare, for calibrated default positions) overlay needed to shrink.
+    normalized_order_form = get_transformed_order_form(order_form_pdf, fit=fit)
     merge_pdf(normalized_order_form, production_order_pdf, overlay_bytes, out_path, rotate_deg=rotate_deg,
               min_x=min_x, min_y=min_y)
 

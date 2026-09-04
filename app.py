@@ -2282,11 +2282,12 @@ class SingleOrderTab(ttk.Frame):
         self.status.config(text="Working…", foreground="#555")
         self.update_idletasks()
 
-        # Always normalized to a portrait PAGE_W x PAGE_H page (see
-        # normalize_to_portrait_page()) even with no manual rotate/resize/
-        # contrast -- only overridden below if bg_rotation/bg_scale/
-        # bg_contrast add something on top.
-        order_form_for_merge = engine.get_transformed_order_form(ctx["order_form"])
+        # bg_rotation/bg_scale/bg_contrast default to "nothing on top of the
+        # plain portrait normalization" and are only overridden below when
+        # the live layout's saved background transform actually applies to
+        # THIS order (matches() below) -- a non-matching layout falls back
+        # to a fresh default order form same as it does for items/brackets.
+        bg_rotation, bg_scale, bg_contrast = 0, 1.0, 1.0
         if ctx["profile"] is None:
             # Manual-only mode (see _validate_and_prepare()'s profile_warning) --
             # there's no calibrated default layout to fall back to, so this
@@ -2300,10 +2301,7 @@ class SingleOrderTab(ttk.Frame):
             brackets = []  # not drawn without a profile anyway -- see render_page()
             bar_offset = self.layout.get_bar_offset()  # bar is still draggable in manual mode -- see sync_material()
             page_rotation = self.layout.bg_rotation
-            if (self.layout.bg_rotation or abs(self.layout.bg_scale - 1.0) > 0.001
-                    or abs(self.layout.bg_contrast - 1.0) > 0.001):
-                order_form_for_merge = engine.get_transformed_order_form(
-                    ctx["order_form"], self.layout.bg_rotation, self.layout.bg_scale, self.layout.bg_contrast)
+            bg_rotation, bg_scale, bg_contrast = self.layout.bg_rotation, self.layout.bg_scale, self.layout.bg_contrast
             if page_rotation:
                 items, brackets = engine.rotate_overlay_for_page(None, False, items, brackets, page_rotation)
         else:
@@ -2318,10 +2316,7 @@ class SingleOrderTab(ttk.Frame):
                 brackets = self.layout.get_brackets()  # manual nudge(s)/rotation(s) from the live preview, if any
                 bar_offset = self.layout.get_bar_offset()  # manual nudge for the Traveler bar, if any
                 page_rotation = self.layout.bg_rotation
-                if (self.layout.bg_rotation or abs(self.layout.bg_scale - 1.0) > 0.001
-                        or abs(self.layout.bg_contrast - 1.0) > 0.001):
-                    order_form_for_merge = engine.get_transformed_order_form(
-                        ctx["order_form"], self.layout.bg_rotation, self.layout.bg_scale, self.layout.bg_contrast)
+                bg_rotation, bg_scale, bg_contrast = self.layout.bg_rotation, self.layout.bg_scale, self.layout.bg_contrast
                 if self.layout.bg_rotation:
                     # Rotating the background swaps its width/height -- without
                     # also rotating the overlay's own coordinates to match,
@@ -2339,10 +2334,26 @@ class SingleOrderTab(ttk.Frame):
                 brackets = [{"offset": (0.0, 0.0), "rotation": 0}]
                 bar_offset = (0.0, 0.0)
                 page_rotation = 0
+
+        # Auto-shrink-to-fit: if the material bar, a note, or anything else
+        # ended up positioned outside the real printable page after all of
+        # the above -- most commonly something dragged below or beside the
+        # drawing -- shrink the whole page's content (the background
+        # drawing AND every overlay item, by the same factor, so they stay
+        # aligned with each other) just enough for everything to land back
+        # inside the real page and actually print, instead of silently
+        # printing with that content missing. A no-op computed here for the
+        # overwhelming majority of orders, where nothing was ever
+        # positioned out of bounds in the first place -- see
+        # engine.compute_page_fit().
+        fit = engine.compute_page_fit(ctx["profile"], ctx["material"], items, wide_origin=wide_origin,
+                                       brackets=brackets, bar_offset=bar_offset, page_rotation=page_rotation)
+        order_form_for_merge = engine.get_transformed_order_form(
+            ctx["order_form"], bg_rotation, bg_scale, bg_contrast, fit=fit)
         try:
             overlay_bytes, overlay_min_x, overlay_min_y = engine.render_page(
                 ctx["profile"], ctx["material"], items, wide_origin=wide_origin,
-                brackets=brackets, bar_offset=bar_offset, page_rotation=page_rotation)
+                brackets=brackets, bar_offset=bar_offset, page_rotation=page_rotation, fit=fit)
             engine.merge_pdf(order_form_for_merge, ctx["production_order"], overlay_bytes, ctx["out_path"],
                               min_x=overlay_min_x, min_y=overlay_min_y)
         except Exception as e:
@@ -2406,8 +2417,11 @@ class SingleOrderTab(ttk.Frame):
         wide_msg = "  ⚠ WIDE PANEL: origin moved to bottom-left, please verify." if wide_origin else ""
         thick_msg = "  ⚠ Thickness entered but not supported for this product yet — it was skipped." if thickness_unsupported else ""
         profile_msg = f"  ⚠ {ctx['profile_warning']}" if ctx.get("profile_warning") else ""
+        fit_msg = (f"  ⚠ Something (e.g. the material bar) was positioned outside the printable page, "
+                   f"so the drawing was auto-shrunk to {round(fit[0] * 100)}% to fit it in — check the result."
+                   if fit[0] < 0.999 else "")
         status_color = "#b00020" if page_note else "#0a7d2c"
-        self.status.config(text=f"Done → {ctx['out_path']} (2 pages, page 2 rotated){wide_msg}{thick_msg}{profile_msg}{page_note}",
+        self.status.config(text=f"Done → {ctx['out_path']} (2 pages, page 2 rotated){wide_msg}{thick_msg}{profile_msg}{fit_msg}{page_note}",
                             foreground=status_color)
 
 

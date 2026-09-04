@@ -387,3 +387,100 @@ adjustment, so that's a reasonable next step if it's ever actually wanted, not a
 Verified headlessly: rotation math round-trips exactly after 8×45° (back to the original endpoints,
 sub-microinch), and it renders correctly both with a calibrated profile and in profile=None
 (manual-only) mode. README updated with a description of the new toolbar button.
+
+**(Undocumented here until now, shipped between 2026-08-28 and 2026-09-04):** SRC-D1/SRC-D3 product
+types (reusing CFSRC's calibrated geometry; D1 auto-adds a pilot-hole note, D3 the flange note), a
+fix for the Windows self-updater's `ren` failing because the relaunch `cmd.exe` inherited the
+running app's own directory as its cwd, and a "Darken lines/text" contrast control for faint
+CAD/CAM exports (e.g. Aspire's PDF output) and washed-out scans, followed by a fix for that same
+feature causing severe quality loss/dropped linework on a source page sized to the real physical
+part rather than Letter — root cause was an unnecessary lossy second rasterization pass, not the
+contrast math; fixed by applying contrast during the original full-resolution render instead.
+
+**2026-09-04:** A real Aspire CIS order (manual-only mode, no calibrated profile) had its drawing
+exported to fill the entire page with zero margin at the bottom, so dragging the Traveler
+material bar below it pushed the bar past the real page's own physical boundary — PDF pages have a
+fixed MediaBox, and the existing overlay "auto-grow" only resizes the overlay's OWN page, which
+doesn't help: `merge_pdf()` always composites onto the real target page using the fixed canonical
+`PAGE_W x PAGE_H` -> real-page ratio, so anything outside that canonical box lands outside the real
+page too, no matter how the overlay's own page was sized. Confirmed this diagnosis against the
+user's actual files (`pypdf`/`pypdfium2` inspection) before proposing a fix, per this repo's normal
+practice of not guessing at physically-meaningful behavior.
+
+User explicitly asked for auto-shrink-to-fit rather than just a warning: "id rather they just print
+and the drawing shrunk to make it fit below it." Implemented as `engine.compute_page_fit()` +
+`engine.apply_page_fit()`: a uniform scale factor `k <= 1.0` anchored at whichever edge of the real
+page ISN'T overflowing (e.g. content hanging below anchors at the top and shrinks upward, freeing
+blank space at the bottom), computed from the same content bounding box `_content_bbox()` already
+used for auto-grow. Applying the identical `(k, anchor)` to BOTH the background drawing (a new `fit`
+parameter threaded through `normalize_to_portrait_page()`/`get_transformed_order_form()`) and every
+overlay coordinate (`render_page()`) keeps the drawing and every item — including a calibrated
+origin bracket or dimension callout, in the rare case one of those is what overflowed — exactly
+aligned with each other throughout, just at a slightly smaller overall size; this is a pure
+similarity transform, not an independent reshuffling of drawing vs. overlay, so it can't misalign a
+CNC-critical reference point relative to the drawing it's calibrated against.
+
+Learned from the earlier contrast quality-loss bug and applied the same fix up front this time: fit
+is baked into `normalize_to_portrait_page()`'s own first, full-resolution render whenever the
+background isn't ALSO being manually rotated (the common case), never into a second lossy
+re-rasterization pass. Only a background rotation combined with an active fit needs a second pass
+(an existing, already-accepted trade-off rotation/scale already had) — verified this combination
+still produces the correct page size and placement, just at the pre-existing rotation/scale quality
+cost, not a new one.
+
+A no-op (`k == 1.0`) for the overwhelming majority of orders, where nothing was ever positioned
+outside the real page — verified via a headless unit test (an off-page material bar's canonical
+y-coordinate lands at exactly 0 after the fit transform, i.e. right at the real page's edge) and a
+full render→merge→rasterize end-to-end test (the bar is visibly present in the final merged PDF's
+rendered pixels, at the very bottom of the physical page, where it previously rendered nowhere at
+all). Wired into `generate()`'s both branches (profile-based and manual-only) in `app.py`; the
+status line after Generate now says when a shrink was applied and by roughly how much. Deliberately
+scoped to `generate()`'s final output only, NOT the live interactive preview/canvas — the preview's
+whole coordinate system (`_pdf_to_canvas`/`_canvas_to_pdf_delta`, dragging, hit-testing) stays
+untouched, since rewiring all of that to also show the shrink live would be a much larger, riskier
+change for a feature that (by design) only ever activates in a rare, already-abnormal case; the
+tradeoff is that the live editor won't visually preview the shrink before Generate is clicked, only
+report it afterward. README updated with a short "Auto-shrink-to-fit" explanation.
+
+**Same day, follow-up:** user pushed back on the earlier contrast quality-loss diagnosis --
+"i dont think it has anything to do with darkening... even without darkening its still really bad
+export but the original pdf is fine." Reproduced against the exact Aspire file from before: at
+contrast=1.0 (no darkening at all) the rendered result was already clean in my own test, which
+didn't match the report, so instead of guessing again I inspected the actual PDF content stream
+(`pikepdf.parse_content_stream`) rather than just eyeballing renders. Found every stroke in the file
+uses PDF line width **0** -- a "hairline," meaning exactly 1 device pixel wide at whatever resolution
+it's rasterized at, a width that does NOT scale with the page's own content. Confirmed this, not
+color, was the real cause by forcing every stroke color in the file to pure black (keeping width 0)
+and rendering it through the unmodified pipeline: still just as faint. On the 30.5x60.75" real-size
+Aspire example, that 1 device pixel ends up representing roughly 0.07pt on the final Letter page --
+below the threshold of visibility once anti-aliased/downsampled, regardless of what color it's
+nominally set to. Separately, the user asked in-thread how to darken Aspire's own export (dimension
+lines default to a mid-gray "Dimensions" layer in Aspire, per Vectric's own documentation/forum) --
+useful on its own, but recoloring that layer to black doesn't change its width, so it didn't fully
+fix what they were seeing either, consistent with the width-not-color diagnosis.
+
+Added `engine._thicken_thin_lines()`, called unconditionally inside `normalize_to_portrait_page()`
+(not gated behind the contrast control -- it's a real hairline-width source, so it's just as faint
+at contrast=1.0) right after rendering and before the optional darken step (the two operations
+commute for a monotonic LUT, so order doesn't actually matter, but this keeps contrast's own
+docstring claim -- "applied to the original high-resolution render" -- true for both). Grows every
+dark pixel outward by a radius computed from how much this source is being shrunk (`fit_scale`) --
+scaled so a normal Letter-ish source gets essentially no thickening (a no-op) while something shrunk
+drastically gets thickened enough that even a hairline should reach roughly 0.4pt once printed.
+Tried PIL's `ImageFilter.MinFilter` first (the "obviously correct" sliding-window minimum) but it
+took 15-20+ seconds on the real 5490x10935px render -- too slow for something that runs on every
+newly-loaded oversized order form. Replaced it with a fast approximation: reshape into
+NxN pixel blocks, take each block's darkest pixel (`numpy`, vectorized, no sliding window), then
+upsample back to full size with nearest-neighbor. Visually indistinguishable from the true min
+filter for this purpose (thickening already-thin linework, not precision geometry) and ~4x faster in
+testing (20s -> 5s including the render+wrap+cache-write around it). This is a new dependency
+(`numpy`) -- added to both launchers' (`--command`/`.bat`) auto-install lists, the Windows build
+workflow's pip install line, and the README's dependency list; not added to either PyInstaller
+`.spec`'s `hiddenimports` since a plain top-level `import numpy` (even inside a function body) is
+picked up by PyInstaller's static analysis automatically. Verified end-to-end against the real file:
+clean, bold, legible lines and text at contrast=1.0 (no darkening at all) where before they were
+faint even fully recolored to black, and combining thickening with contrast=2.0 darkening on top
+looks better still. Also verified a normal Letter-sized order form triggers no thickening at all
+(sub-millisecond, well under the threshold that would even attempt a block size > 1) and that this
+composes correctly with the same-day auto-shrink-to-fit feature. README updated with a short
+explanation of the automatic thickening and the new dependency.
