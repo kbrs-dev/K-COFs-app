@@ -563,6 +563,25 @@ def _render_pil(pdf_path: str):
     return pil_img
 
 
+def _darken_toward_black(pil_img, factor: float):
+    """Darkens every pixel proportional to its own distance from pure white
+    -- new = 255 - factor*(255 - old) -- rather than pivoting around the
+    image's own average brightness the way PIL's stock
+    ImageEnhance.Contrast does. That distinction matters here: a page that's
+    almost entirely white (typical for a CAD/CAM export with a few faint
+    gray lines) has an average brightness very close to white, and a pixel
+    that happens to land slightly ABOVE that average would get pushed
+    LIGHTER by a mean-pivoted contrast, not darker -- the opposite of what
+    "darken the lines" is supposed to do. This version can't do that: white
+    (255) is a fixed point, factor is always >= 1.0 (see
+    InteractiveLayout._adjust_contrast() in app.py), so every pixel only
+    ever moves toward black or stays put, never lighter than it started."""
+    if pil_img.mode != "RGB":
+        pil_img = pil_img.convert("RGB")
+    lut = [max(0, min(255, round(255 - factor * (255 - v)))) for v in range(256)]
+    return pil_img.point(lut * len(pil_img.getbands()))
+
+
 def _wrap_pil_as_pdf(pil_img, page_w: float, page_h: float, offset_x: float = 0.0,
                       offset_y: float = 0.0, draw_w: float = None, draw_h: float = None) -> str:
     """Draws pil_img onto a fresh page_w x page_h PDF page at the given
@@ -577,7 +596,7 @@ def _wrap_pil_as_pdf(pil_img, page_w: float, page_h: float, offset_x: float = 0.
     return out_path
 
 
-def normalize_to_portrait_page(order_form_path: str) -> str:
+def normalize_to_portrait_page(order_form_path: str, contrast: float = 1.0) -> str:
     """Every exported/previewed order form page is always exactly
     PAGE_W x PAGE_H (portrait Letter, 8.5x11) -- a landscape scan (common
     for long linear panels) gets rotated to portrait first; whatever's left
@@ -588,7 +607,7 @@ def normalize_to_portrait_page(order_form_path: str) -> str:
     by the fixed canonical->real ratio, the two together mean that ratio is
     just 1:1 for the overwhelmingly common case, eliminating the whole
     class of scale/aspect distortion bugs at the source rather than
-    reconciling them after the fact. Cached by path+mtime.
+    reconciling them after the fact. Cached by path+mtime+contrast.
 
     Deliberately does NOT auto-rotate a landscape-shaped source to portrait:
     a landscape image could need +90 or -90 to read right-side-up depending
@@ -599,18 +618,35 @@ def normalize_to_portrait_page(order_form_path: str) -> str:
     drawing" control for that; it already correctly repositions calibrated
     items to match (see rotate_overlay_for_page()), since a human picking
     the direction can just look at the result and try the other way if it's
-    wrong."""
+    wrong.
+
+    contrast is applied HERE, to this function's own full-resolution render,
+    rather than in get_transformed_order_form() -- deliberately, to avoid a
+    real quality-loss bug: a source page that's much larger than Letter (a
+    CAM/CAD export like Aspire's, sized to the actual physical part -- one
+    real example was 2196x4374pt, i.e. 30.5x60.75 real inches) gets shrunk
+    substantially to fit here, but the full-resolution image data stays
+    embedded regardless of how small it's drawn. Re-rasterizing THAT
+    already-normalized page a second time (as get_transformed_order_form()
+    does for rotation/scale) flattens it at only _BG_RENDER_SCALE relative
+    to the small Letter page -- undersampling the embedded detail severely
+    for a heavily-shrunk source, visibly degrading or dropping fine
+    linework. Applying contrast against the original high-resolution render
+    instead avoids that second, lossy pass entirely for the common
+    contrast-only case (see get_transformed_order_form())."""
     base_path = ensure_pdf(order_form_path)
     try:
         mtime = os.path.getmtime(order_form_path)
     except OSError:
         mtime = None
-    cache_key = (order_form_path, mtime)
+    cache_key = (order_form_path, mtime, round(contrast, 3))
     cached = _NORMALIZED_PAGE_CACHE.get(cache_key)
     if cached and os.path.isfile(cached):
         return cached
 
     pil_img = _render_pil(base_path)
+    if abs(contrast - 1.0) >= 0.001:
+        pil_img = _darken_toward_black(pil_img, contrast)
     img_w_pts, img_h_pts = pil_img.width / _BG_RENDER_SCALE, pil_img.height / _BG_RENDER_SCALE
     fit_scale = min(PAGE_W / img_w_pts, PAGE_H / img_h_pts)
     draw_w, draw_h = img_w_pts * fit_scale, img_h_pts * fit_scale
@@ -641,13 +677,21 @@ def get_transformed_order_form(order_form_path: str, rotation: int = 0, scale: f
     coordinate space, and merge_pdf()'s overlay compositing operates in
     that raw space, so a metadata-only rotation would leave the overlay
     landing in the wrong place relative to the visibly-rotated background.
-    Contrast is applied for the same reason it has to go through the image
-    pipeline at all: there's no PDF-content-stream equivalent of "make the
-    lines darker" for an arbitrary vector or scanned source -- only a
-    rendered image can be leveled/contrasted."""
-    base_path = normalize_to_portrait_page(order_form_path)
+
+    contrast is passed straight through to normalize_to_portrait_page(),
+    NOT re-applied here -- see that function's docstring for why: applying
+    it to base_path's own full-resolution render (rather than to a second,
+    lower-resolution re-rasterization of the already-normalized page) is
+    what avoids visibly degrading or dropping fine linework on a source
+    that's much larger than Letter (a CAM/CAD export sized to the real
+    physical part) and had to be shrunk substantially to fit. That means
+    rotation/scale are the only two things that actually need this
+    function's own second rasterization pass; a contrast-only call (by far
+    the common case for this feature) hits the fast path below and never
+    touches this lossier path at all."""
+    base_path = normalize_to_portrait_page(order_form_path, contrast)
     rotation = rotation % 360
-    if rotation == 0 and abs(scale - 1.0) < 0.001 and abs(contrast - 1.0) < 0.001:
+    if rotation == 0 and abs(scale - 1.0) < 0.001:
         return base_path
     try:
         mtime = os.path.getmtime(order_form_path)
@@ -658,10 +702,7 @@ def get_transformed_order_form(order_form_path: str, rotation: int = 0, scale: f
     if cached and os.path.isfile(cached):
         return cached
 
-    pil_img = _render_pil(base_path)
-    if abs(contrast - 1.0) >= 0.001:
-        from PIL import ImageEnhance  # local import: only needed for this rare path
-        pil_img = ImageEnhance.Contrast(pil_img).enhance(contrast)
+    pil_img = _render_pil(base_path)  # base_path already has contrast baked in, at full resolution
     if rotation:
         # PIL rotates counter-clockwise for positive angles; PDF /Rotate and
         # the app's other 90-degree rotations (bracket, cut line) are
