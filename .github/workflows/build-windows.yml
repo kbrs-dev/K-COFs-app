@@ -33,7 +33,7 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install reportlab pypdf Pillow tkinterdnd2 pypdfium2 pikepdf pyinstaller
+          pip install reportlab pypdf Pillow tkinterdnd2 pypdfium2 pikepdf numpy pyinstaller
 
       - name: Build with PyInstaller
         run: pyinstaller kbrs_markup_windows.spec --noconfirm

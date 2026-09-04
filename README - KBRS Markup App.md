@@ -7,7 +7,7 @@ the finished, annotated production sheet — no PowerPoint, no manual dragging.
 
 $0. Everything here is free and runs on your own computer (Mac or Windows):
 - Python (free, from python.org — you likely already have it)
-- tkinter, reportlab, pypdf, Pillow, tkinterdnd2, pypdfium2 (free, open-source libraries)
+- tkinter, reportlab, pypdf, Pillow, tkinterdnd2, pypdfium2, pikepdf, numpy (free, open-source libraries)
 
 No subscriptions, no accounts, no API keys.
 
@@ -129,6 +129,14 @@ loads an order, every dimension/thickness label is draggable right there:
   all three back to normal. This is baked into the final PDF the same way a
   rotate/resize is — it changes how the customer's drawing itself prints,
   not just the live preview.
+- **A large-format CAM/CAD export (e.g. Aspire, sized to the actual physical
+  part rather than a normal Letter page) also gets its thin lines
+  automatically thickened**, always, even without touching the contrast
+  control — those exports typically use a "hairline" stroke width that
+  stays a fixed 1 pixel wide no matter the color, so on a source shrunk way
+  down to fit the small page, recoloring the lines darker in Aspire alone
+  won't make them print any thicker. No action needed; it only kicks in for
+  a source that actually needs it (a normal Letter-ish scan is unaffected).
 - Editing here, then changing the material/thickness/curb-depth fields on
   the left, keeps your edits — only picking a *different* order form/production
   order resets the layout back to defaults.

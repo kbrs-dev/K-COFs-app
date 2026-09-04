@@ -114,6 +114,7 @@ from reportlab.pdfgen import canvas
 from reportlab.pdfbase.pdfmetrics import stringWidth
 from reportlab.lib.colors import Color
 from reportlab.lib.utils import ImageReader
+from PIL import Image
 import io
 
 # The default measurement-overlay color ("orange" everywhere in this file)
@@ -582,6 +583,76 @@ def _darken_toward_black(pil_img, factor: float):
     return pil_img.point(lut * len(pil_img.getbands()))
 
 
+# The minimum line weight (in canonical/final-page points) a hairline
+# should still have once printed, regardless of how thin or light it
+# started out. 0.4pt is a modest, still-fine "hairline" weight (~0.14mm) --
+# thin enough not to visibly bulk up an already-fine drawing, thick enough
+# to survive anti-aliasing/downsampling instead of dissolving to invisible.
+_MIN_PRINTED_LINE_WIDTH_PT = 0.4
+# Hard cap on the thickening block size -- both to bound how long it can
+# take on a very large render, and so a pathologically tiny fit_scale (a
+# source page enormously larger than Letter) can't balloon every line into
+# a visibly thick blob instead of merely "thick enough."
+_MAX_THICKEN_BLOCK = 15
+
+
+def _thicken_thin_lines(pil_img, fit_scale: float):
+    """Grows every dark feature outward by a small radius (pixel-block
+    minimum-pooling, then nearest-neighbor upsampling back to full size --
+    see below for why not a true sliding-window min filter), so a true
+    hairline stroke survives being shrunk down to the small canonical page
+    instead of anti-aliasing away to a barely-visible light smear.
+
+    This targets a real, confirmed-by-inspection cause, not a guess: a
+    real Aspire CAM export's dimension/measurement lines use PDF line
+    width 0 -- "exactly 1 device pixel wide at whatever resolution it's
+    rasterized at," a width that does NOT scale with the page's own
+    content. On an oversized source (one real example: 2196x4374pt, i.e. a
+    30.5x60.75" real part, shrunk to fit the small canonical Letter page)
+    that 1 pixel ends up representing a small fraction of a final printed
+    point regardless of the line's color -- confirmed by forcing every
+    stroke in that exact file to pure black and finding the rendered
+    result exactly as faint as before recoloring, proving this is a width
+    problem, not a color one, so no amount of "darken lines" contrast can
+    fix it (that only pushes each pixel's existing value darker; it can't
+    make a sub-pixel-coverage line occupy more pixels).
+
+    Scaled by fit_scale (this render's own shrink ratio, computed by the
+    caller from the same source dimensions used to fit it to the canonical
+    page) so a normal Letter-ish source -- not shrunk at all -- gets
+    essentially no thickening (the common case, a no-op), while a source
+    shrunk drastically gets thickened just enough that even its thinnest
+    hairline should reach roughly _MIN_PRINTED_LINE_WIDTH_PT once printed.
+
+    Implemented as block min-pooling (reshape into blocksize x blocksize
+    tiles, take each tile's darkest pixel, upsample the result back to full
+    size with nearest-neighbor) rather than PIL's ImageFilter.MinFilter --
+    empirically, a true sliding-window min filter at the resolution this
+    runs at (a multi-thousand-pixel-per-side render) took 15-20+ seconds on
+    a real example; block-pooling is a coarser approximation (a fixed grid
+    instead of a sliding window) but visually indistinguishable for this
+    purpose -- thickening already-thin linework, not precision geometry --
+    and around 7x faster in testing against that same file."""
+    if fit_scale <= 0:
+        return pil_img
+    radius_px = (_MIN_PRINTED_LINE_WIDTH_PT / fit_scale) * _BG_RENDER_SCALE / 2
+    block = min(_MAX_THICKEN_BLOCK, int(round(radius_px)) * 2 + 1)
+    if block <= 1:
+        return pil_img
+    import numpy as np  # local import: only needed for this (rare, oversized-source) path
+    if pil_img.mode != "RGB":
+        pil_img = pil_img.convert("RGB")
+    w, h = pil_img.size
+    arr = np.asarray(pil_img)
+    pad_h, pad_w = (-h) % block, (-w) % block
+    if pad_h or pad_w:
+        arr = np.pad(arr, ((0, pad_h), (0, pad_w), (0, 0)), mode="edge")
+    h2, w2 = arr.shape[0], arr.shape[1]
+    pooled = arr.reshape(h2 // block, block, w2 // block, block, -1).min(axis=(1, 3))
+    small_img = Image.fromarray(pooled.astype(np.uint8))
+    return small_img.resize((w, h), resample=Image.NEAREST)
+
+
 def _wrap_pil_as_pdf(pil_img, page_w: float, page_h: float, offset_x: float = 0.0,
                       offset_y: float = 0.0, draw_w: float = None, draw_h: float = None) -> str:
     """Draws pil_img onto a fresh page_w x page_h PDF page at the given
@@ -645,6 +716,12 @@ def normalize_to_portrait_page(order_form_path: str, contrast: float = 1.0, fit:
     instead avoids that second, lossy pass entirely for the common
     contrast-only case (see get_transformed_order_form()).
 
+    Also always applies _thicken_thin_lines() here, unconditionally (not
+    gated behind contrast at all -- a real hairline-width source is just as
+    faint at contrast=1.0, see that function's docstring), for the same
+    "do it against the original high-resolution render, not a later
+    downsampled one" reason.
+
     fit (see compute_page_fit()/render_page()'s own fit parameter), when
     not a no-op, is applied the same way and for the same reason: it
     shrinks-and-repositions the drawing within this same first,
@@ -664,10 +741,11 @@ def normalize_to_portrait_page(order_form_path: str, contrast: float = 1.0, fit:
         return cached
 
     pil_img = _render_pil(base_path)
-    if abs(contrast - 1.0) >= 0.001:
-        pil_img = _darken_toward_black(pil_img, contrast)
     img_w_pts, img_h_pts = pil_img.width / _BG_RENDER_SCALE, pil_img.height / _BG_RENDER_SCALE
     fit_scale = min(PAGE_W / img_w_pts, PAGE_H / img_h_pts)
+    pil_img = _thicken_thin_lines(pil_img, fit_scale)
+    if abs(contrast - 1.0) >= 0.001:
+        pil_img = _darken_toward_black(pil_img, contrast)
     draw_w, draw_h = img_w_pts * fit_scale, img_h_pts * fit_scale
     offset_x, offset_y = (PAGE_W - draw_w) / 2, (PAGE_H - draw_h) / 2
 

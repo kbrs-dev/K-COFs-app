@@ -441,3 +441,46 @@ untouched, since rewiring all of that to also show the shrink live would be a mu
 change for a feature that (by design) only ever activates in a rare, already-abnormal case; the
 tradeoff is that the live editor won't visually preview the shrink before Generate is clicked, only
 report it afterward. README updated with a short "Auto-shrink-to-fit" explanation.
+
+**Same day, follow-up:** user pushed back on the earlier contrast quality-loss diagnosis --
+"i dont think it has anything to do with darkening... even without darkening its still really bad
+export but the original pdf is fine." Reproduced against the exact Aspire file from before: at
+contrast=1.0 (no darkening at all) the rendered result was already clean in my own test, which
+didn't match the report, so instead of guessing again I inspected the actual PDF content stream
+(`pikepdf.parse_content_stream`) rather than just eyeballing renders. Found every stroke in the file
+uses PDF line width **0** -- a "hairline," meaning exactly 1 device pixel wide at whatever resolution
+it's rasterized at, a width that does NOT scale with the page's own content. Confirmed this, not
+color, was the real cause by forcing every stroke color in the file to pure black (keeping width 0)
+and rendering it through the unmodified pipeline: still just as faint. On the 30.5x60.75" real-size
+Aspire example, that 1 device pixel ends up representing roughly 0.07pt on the final Letter page --
+below the threshold of visibility once anti-aliased/downsampled, regardless of what color it's
+nominally set to. Separately, the user asked in-thread how to darken Aspire's own export (dimension
+lines default to a mid-gray "Dimensions" layer in Aspire, per Vectric's own documentation/forum) --
+useful on its own, but recoloring that layer to black doesn't change its width, so it didn't fully
+fix what they were seeing either, consistent with the width-not-color diagnosis.
+
+Added `engine._thicken_thin_lines()`, called unconditionally inside `normalize_to_portrait_page()`
+(not gated behind the contrast control -- it's a real hairline-width source, so it's just as faint
+at contrast=1.0) right after rendering and before the optional darken step (the two operations
+commute for a monotonic LUT, so order doesn't actually matter, but this keeps contrast's own
+docstring claim -- "applied to the original high-resolution render" -- true for both). Grows every
+dark pixel outward by a radius computed from how much this source is being shrunk (`fit_scale`) --
+scaled so a normal Letter-ish source gets essentially no thickening (a no-op) while something shrunk
+drastically gets thickened enough that even a hairline should reach roughly 0.4pt once printed.
+Tried PIL's `ImageFilter.MinFilter` first (the "obviously correct" sliding-window minimum) but it
+took 15-20+ seconds on the real 5490x10935px render -- too slow for something that runs on every
+newly-loaded oversized order form. Replaced it with a fast approximation: reshape into
+NxN pixel blocks, take each block's darkest pixel (`numpy`, vectorized, no sliding window), then
+upsample back to full size with nearest-neighbor. Visually indistinguishable from the true min
+filter for this purpose (thickening already-thin linework, not precision geometry) and ~4x faster in
+testing (20s -> 5s including the render+wrap+cache-write around it). This is a new dependency
+(`numpy`) -- added to both launchers' (`--command`/`.bat`) auto-install lists, the Windows build
+workflow's pip install line, and the README's dependency list; not added to either PyInstaller
+`.spec`'s `hiddenimports` since a plain top-level `import numpy` (even inside a function body) is
+picked up by PyInstaller's static analysis automatically. Verified end-to-end against the real file:
+clean, bold, legible lines and text at contrast=1.0 (no darkening at all) where before they were
+faint even fully recolored to black, and combining thickening with contrast=2.0 darkening on top
+looks better still. Also verified a normal Letter-sized order form triggers no thickening at all
+(sub-millisecond, well under the threshold that would even attempt a block size > 1) and that this
+composes correctly with the same-day auto-shrink-to-fit feature. README updated with a short
+explanation of the automatic thickening and the new dependency.

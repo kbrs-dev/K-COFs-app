@@ -69,4 +69,10 @@ if not %ERRORLEVEL%==0 (
     %PYCMD% -m pip install --user --quiet pikepdf
 )
 
+%PYCMD% -c "import numpy" >nul 2>nul
+if not %ERRORLEVEL%==0 (
+    echo Installing free image-processing support...
+    %PYCMD% -m pip install --user --quiet numpy
+)
+
 %PYCMD% app.py

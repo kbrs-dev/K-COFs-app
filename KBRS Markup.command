@@ -45,4 +45,9 @@ if ! python3 -c "import pikepdf" &> /dev/null; then
     python3 -m pip install --user --quiet pikepdf
 fi
 
+if ! python3 -c "import numpy" &> /dev/null; then
+    echo "Installing free image-processing support (numpy)..."
+    python3 -m pip install --user --quiet numpy
+fi
+
 python3 app.py
