@@ -913,13 +913,21 @@ class InteractiveLayout(ttk.Frame):
                 # extended/shortened, not just moved as a whole -- generic
                 # across any line-kind item that opts in (cut_line and the
                 # manual diagonal line both do), not just cut_line. Sized
-                # generously (not just visually -- this radius is also the
-                # actual clickable hit target) since a precise trackpad
-                # click on a much smaller dot proved hard to land in
-                # practice.
-                r = 8
-                h0 = self.canvas.create_oval(cx0 - r, cy0 - r, cx0 + r, cy0 + r, fill=color_hex, outline="")
-                h1 = self.canvas.create_oval(cx1 - r, cy1 - r, cx1 + r, cy1 + r, fill=color_hex, outline="")
+                # generously relative to the original (not just visually --
+                # this radius is also the actual clickable hit target)
+                # since a precise trackpad click on a much smaller dot
+                # proved hard to land in practice, but not so large it
+                # looks like a blob sitting on the drawing.
+                r = 6
+                # An explicit same-color outline (not outline="") -- a
+                # fill-only oval rendered invisibly on macOS in practice
+                # even though it worked fine on Windows; giving it a real
+                # (if 0-width) outline avoids depending on each platform's
+                # Tk build filling a bare shape the same way.
+                h0 = self.canvas.create_oval(cx0 - r, cy0 - r, cx0 + r, cy0 + r,
+                                              fill=color_hex, outline=color_hex, width=1)
+                h1 = self.canvas.create_oval(cx1 - r, cy1 - r, cx1 + r, cy1 + r,
+                                              fill=color_hex, outline=color_hex, width=1)
                 self.canvas.tag_bind(h0, "<ButtonPress-1>", lambda e, k=key: self._line_endpoint_press(e, k, 0))
                 self.canvas.tag_bind(h0, "<B1-Motion>", lambda e, k=key: self._line_endpoint_motion(e, k, 0))
                 self.canvas.tag_bind(h0, "<ButtonRelease-1>", lambda e: self._line_endpoint_release())
