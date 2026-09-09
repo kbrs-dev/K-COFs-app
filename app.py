@@ -874,6 +874,15 @@ class InteractiveLayout(ttk.Frame):
                 self.canvas.tag_bind(cid, "<Button-3>", lambda e, idx=i: self._bracket_context_menu(e, idx))
         for other_cid in self.canvas_ids.values():
             self.canvas.tag_raise(other_cid)  # keep draggable items above the bar/bracket
+        # ...including a line's own endpoint handles: canvas_ids above only
+        # covers each item's main shape (the line/text itself), but a line's
+        # small drag handles live in the separate line_handle_ids dict, so
+        # without this they'd stay buried under the bar/bracket -- silently
+        # unclickable, with nothing visibly wrong, whenever a handle happens
+        # to land under either (e.g. a diagonal line crossing near them).
+        for handles in self.line_handle_ids.values():
+            for h in handles:
+                self.canvas.tag_raise(h)
 
     # -- drawing draggable items -----------------------------------------------
     def _clear_canvas_for(self, key):
@@ -903,8 +912,12 @@ class InteractiveLayout(ttk.Frame):
                 # small draggable handles at each end so the line can be
                 # extended/shortened, not just moved as a whole -- generic
                 # across any line-kind item that opts in (cut_line and the
-                # manual diagonal line both do), not just cut_line.
-                r = 5
+                # manual diagonal line both do), not just cut_line. Sized
+                # generously (not just visually -- this radius is also the
+                # actual clickable hit target) since a precise trackpad
+                # click on a much smaller dot proved hard to land in
+                # practice.
+                r = 8
                 h0 = self.canvas.create_oval(cx0 - r, cy0 - r, cx0 + r, cy0 + r, fill=color_hex, outline="")
                 h1 = self.canvas.create_oval(cx1 - r, cy1 - r, cx1 + r, cy1 + r, fill=color_hex, outline="")
                 self.canvas.tag_bind(h0, "<ButtonPress-1>", lambda e, k=key: self._line_endpoint_press(e, k, 0))
