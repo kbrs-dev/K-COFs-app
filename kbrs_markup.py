@@ -419,6 +419,74 @@ def apply_update_and_relaunch(staged_app_dir: str) -> None:
     os._exit(0)
 
 
+# ---------------------------------------------------------------------------
+# Self-update, source-install flavor (Mac, or any non-frozen `python3 app.py`
+# checkout -- is_frozen_windows_build() is False there, so the zip-based flow
+# above never applies). This install already updates itself via `git pull` on
+# every launch (see KBRS Markup.command/KBRS Markup.bat), but that only runs
+# at startup with no visible feedback while the app is already open. This
+# gives the same "check on launch, show a button, click to update" UX as the
+# Windows flow above, using git directly instead of a hosted version.txt/zip
+# -- no separate release channel to keep in sync, and (since this repo is
+# public) no authentication needed for the read-only fetch/pull either.
+# ---------------------------------------------------------------------------
+def _repo_dir() -> str:
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+def is_git_source_install() -> bool:
+    """True for a source checkout running inside a git working tree with an
+    upstream tracking branch -- the only shape this update path understands.
+    False for the frozen Windows build (that one's handled above) and for
+    any source copy that isn't a normal git clone (e.g. a zip download),
+    where there's nothing to fetch/pull against."""
+    if is_frozen_windows_build():
+        return False
+    if not os.path.isdir(os.path.join(_repo_dir(), ".git")):
+        return False
+    try:
+        subprocess.run(["git", "rev-parse", "@{u}"], cwd=_repo_dir(), capture_output=True,
+                        check=True, timeout=5)
+        return True
+    except Exception:
+        return False
+
+
+def check_for_git_update(timeout: float = 15.0) -> str | None:
+    """The newer commit's short SHA if `git fetch` finds the upstream branch
+    ahead of HEAD, None if already current. Raises UpdateCheckError (never
+    silently swallowed -- see that class's docstring) if the fetch/check
+    itself fails, e.g. no network."""
+    repo_dir = _repo_dir()
+    try:
+        subprocess.run(["git", "fetch", "--quiet"], cwd=repo_dir, capture_output=True,
+                        check=True, timeout=timeout)
+        local = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo_dir, capture_output=True,
+                                check=True, text=True, timeout=5).stdout.strip()
+        remote = subprocess.run(["git", "rev-parse", "@{u}"], cwd=repo_dir, capture_output=True,
+                                 check=True, text=True, timeout=5).stdout.strip()
+    except Exception as e:
+        raise UpdateCheckError(f"{type(e).__name__}: {e}") from e
+    return None if local == remote else remote
+
+
+def apply_git_update_and_relaunch() -> None:
+    """Pulls (fast-forward only, matching the launcher scripts' own update
+    step -- never a merge/rebase that could touch history) and relaunches
+    this same process in place via os.execv, so there's no separate
+    quit-and-reopen step and no Windows-style "wait for the old process to
+    release its files" dance (a git pull on Mac/Linux can freely overwrite
+    the .py files of an already-running interpreter; only the NEW process
+    started afterward sees the new code). Raises on failure, leaving the
+    running app untouched -- safe to call from a background thread: on
+    success os.execv() replaces the entire process image, every thread
+    included, so there's nothing left afterward to worry about calling
+    from the "wrong" one. Never returns on success."""
+    repo_dir = _repo_dir()
+    subprocess.run(["git", "pull", "--ff-only"], cwd=repo_dir, check=True, timeout=30)
+    os.execv(sys.executable, [sys.executable] + sys.argv)
+
+
 ORANGE = _hex_to_color(get_accent_hex())
 WHITE = Color(1, 1, 1)
 BLACK = Color(0, 0, 0)

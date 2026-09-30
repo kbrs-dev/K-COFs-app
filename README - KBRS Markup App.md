@@ -27,6 +27,11 @@ Windows machines. **GitHub Desktop** (free, no command line) is the easiest way 
   on Windows) automatically runs `git pull` first, so you always get the latest version without
   touching GitHub Desktop yourself — it only asks you to do anything when you're the one making
   changes, not when you're just using the app.
+- **While the app is already open**, a "🔄 Update available" button appears at the top when
+  there's something newer, and File > Check for Updates… checks on demand — no need to quit and
+  reopen just to see if there's an update. Click it and the app updates and relaunches itself.
+  Windows also has this via its own separate self-updater (a packaged download); either way it's
+  the same button in the same spot.
 
 ## First-time setup (one time only, per computer)
 

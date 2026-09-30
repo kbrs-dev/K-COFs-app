@@ -2548,8 +2548,21 @@ def main():
     top_bar.pack(fill="x", padx=8, pady=(6, 0))
     ttk.Button(top_bar, text="Accent color…", command=pick_accent_color).pack(side="right")
 
-    # -- self-update (Windows packaged build only; a no-op everywhere else,
-    # including this Mac dev build) -------------------------------------
+    # -- self-update: the packaged Windows build downloads/stages/swaps a
+    # zip release (see engine.apply_update_and_relaunch()); a source
+    # checkout (Mac, or a non-frozen dev run of Windows) instead does a
+    # plain `git pull` and relaunches itself in place
+    # (engine.apply_git_update_and_relaunch()) -- same button/flow either
+    # way, just a different mechanism underneath. Genuinely a no-op (button
+    # never shows) for any other install shape, e.g. a plain zip download
+    # with no git history to pull from.
+    if engine.is_frozen_windows_build():
+        _update_mode = "frozen"
+    elif engine.is_git_source_install():
+        _update_mode = "git"
+    else:
+        _update_mode = None
+
     update_btn = ttk.Button(top_bar, text="")
     _pending_update_sha = {"sha": None}
 
@@ -2594,15 +2607,51 @@ def main():
 
         threading.Thread(target=worker, daemon=True).start()
 
-    update_btn.config(command=_do_update)
+    def _do_git_update():
+        sha = _pending_update_sha["sha"]
+        if not sha:
+            return
+        if not messagebox.askyesno(
+            "Update available",
+            f"A newer version is available (build {sha[:7]}).\n\n"
+            "Update and relaunch now?",
+        ):
+            return
+        update_btn.config(text="Updating…", state="disabled")
+        root.update_idletasks()
+
+        def worker():
+            try:
+                # Replaces this process on success (os.execv) -- nothing
+                # after this call runs (or needs to). Safe to call from this
+                # background thread: exec() replaces the whole process image,
+                # every thread included, so there's no "other thread" left
+                # to worry about afterward. Only a failure (e.g. git pull
+                # itself fails) reaches the except below.
+                engine.apply_git_update_and_relaunch()
+            except Exception as e:
+                traceback.print_exc()
+                root.after(0, lambda: (
+                    update_btn.config(text="🔄 Update available", state="normal"),
+                    messagebox.showerror(
+                        "Update failed",
+                        f"Couldn't pull/relaunch the update ({type(e).__name__}: {e}).\n\n"
+                        "The app hasn't been changed -- you can try again, or quit and "
+                        "reopen it (the launcher pulls updates automatically too).",
+                    ),
+                ))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    update_btn.config(command=_do_update if _update_mode == "frozen" else _do_git_update)
 
     def _check_for_update_async(silent=True):
-        if not engine.is_frozen_windows_build():
+        if _update_mode is None:
             return
 
         def worker():
             try:
-                sha = engine.check_for_update()
+                sha = engine.check_for_update() if _update_mode == "frozen" else engine.check_for_git_update()
             except engine.UpdateCheckError as e:
                 # A failed check is NOT the same as "up to date" -- silently
                 # treating it that way is exactly how a real network problem
@@ -2645,7 +2694,7 @@ def main():
     menubar.add_cascade(label="File", menu=file_menu)
     recent_menu = tk.Menu(file_menu, tearoff=0)
     file_menu.add_cascade(label="Recent Orders", menu=recent_menu)
-    if engine.is_frozen_windows_build():
+    if _update_mode is not None:
         file_menu.add_separator()
         file_menu.add_command(label="Check for Updates…", command=lambda: _check_for_update_async(silent=False))
 
