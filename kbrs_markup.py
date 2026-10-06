@@ -101,6 +101,7 @@ import math
 import os
 import platform
 import re
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -212,39 +213,63 @@ def clear_recent_orders() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Self-update (Windows packaged build only). build-windows.yml stamps every
-# build with the git commit SHA it was built from, both bundled next to the
-# exe as version.txt and uploaded standalone as its own tiny release asset --
-# the running app can cheaply check "is a newer build published?" on launch
-# without downloading the whole ~32MB zip just to find out, then download and
-# apply it itself if the user asks to. Every step here is best-effort and
-# fails safe: a failed check/download/stage never touches the current,
-# working install; only apply_update_and_relaunch() (called after a
-# successful download+stage) touches it, and even that keeps the old install
-# intact until the new one is confirmed in place.
+# Self-update (either packaged build -- Windows .exe or Mac .app -- not a
+# source checkout, which the separate git-based update path below handles
+# instead). Each platform's build workflow stamps every build with the git
+# commit SHA it was built from, both bundled inside the build as version.txt
+# and uploaded standalone as its own tiny release asset -- the running app
+# can cheaply check "is a newer build published?" on launch without
+# downloading the whole zip just to find out, then download and apply it
+# itself if the user asks to. Every step here is best-effort and fails safe:
+# a failed check/download/stage never touches the current, working install;
+# only apply_update_and_relaunch() (called after a successful download+stage)
+# touches it, and even that keeps the old install intact until the new one
+# is confirmed in place.
 # ---------------------------------------------------------------------------
 GITHUB_REPO = "kbrs-dev/K-COFs-app"
-UPDATE_RELEASE_TAG = "windows-latest-build"
+UPDATE_RELEASE_TAG = "windows-latest-build" if platform.system() == "Windows" else "mac-latest-build"
 _RELEASE_BASE = f"https://github.com/{GITHUB_REPO}/releases/download/{UPDATE_RELEASE_TAG}"
 UPDATE_VERSION_URL = f"{_RELEASE_BASE}/version.txt"
-UPDATE_ZIP_URL = f"{_RELEASE_BASE}/KBRS-Markup-Windows.zip"
+UPDATE_ZIP_NAME = "KBRS-Markup-Windows.zip" if platform.system() == "Windows" else "KBRS-Markup-Mac.zip"
+UPDATE_ZIP_URL = f"{_RELEASE_BASE}/{UPDATE_ZIP_NAME}"
 
 
 def is_frozen_windows_build() -> bool:
-    """True only for an actual packaged Windows .exe (not the Mac build,
-    and not a `python3 app.py` source run) -- the only case self-update
-    applies to."""
+    """True only for an actual packaged Windows .exe."""
     return bool(getattr(sys, "frozen", False)) and platform.system() == "Windows"
+
+
+def is_frozen_mac_build() -> bool:
+    """True only for an actual packaged Mac .app (built from kbrs_markup.spec
+    -- NOT the older "folder of scripts + KBRS Markup.command" setup, which
+    is a source checkout and uses the separate git-based update path, even
+    though it also runs on a Mac)."""
+    return bool(getattr(sys, "frozen", False)) and platform.system() == "Darwin"
+
+
+def is_frozen_build() -> bool:
+    """True for either packaged build -- the zip-download self-update path
+    applies to both the same way, just with a platform-specific zip/relaunch
+    mechanism underneath (see apply_update_and_relaunch())."""
+    return is_frozen_windows_build() or is_frozen_mac_build()
 
 
 def get_local_version() -> str | None:
     """The git commit SHA this running build was made from. None if this
-    isn't a frozen Windows build, or version.txt is missing (e.g. a build
-    from before this feature existed)."""
-    if not is_frozen_windows_build():
+    isn't a frozen (packaged) build, or version.txt is missing (e.g. a build
+    from before this feature existed). version.txt sits next to the .exe on
+    Windows, but inside the .app bundle's Contents/Resources on Mac (the
+    .app's own top level isn't writable post-build the same simple way, and
+    Resources is where PyInstaller/BUNDLE already puts other bundled data)."""
+    if is_frozen_mac_build():
+        # sys.executable: .../KBRS Markup.app/Contents/MacOS/KBRS Markup
+        base = Path(sys.executable).resolve().parent.parent / "Resources"
+    elif is_frozen_windows_build():
+        base = Path(os.path.dirname(sys.executable))
+    else:
         return None
     try:
-        return (Path(os.path.dirname(sys.executable)) / "version.txt").read_text().strip() or None
+        return (base / "version.txt").read_text().strip() or None
     except OSError:
         return None
 
@@ -287,9 +312,10 @@ def check_for_update() -> str | None:
 
 
 def download_update(progress_cb=None) -> str:
-    """Downloads the latest Windows build zip to a temp file and returns its
-    path. progress_cb(bytes_read, total_bytes), if given, is called
-    periodically (total_bytes is -1 if the server didn't send a length)."""
+    """Downloads the latest build zip (Windows or Mac, whichever this
+    process is) to a temp file and returns its path. progress_cb(bytes_read,
+    total_bytes), if given, is called periodically (total_bytes is -1 if the
+    server didn't send a length)."""
     fd, zip_path = tempfile.mkstemp(suffix=".zip", prefix="kbrs_update_")
     os.close(fd)
     with urllib.request.urlopen(UPDATE_ZIP_URL, timeout=30) as resp:
@@ -309,21 +335,37 @@ def download_update(progress_cb=None) -> str:
 
 def stage_update(zip_path: str) -> str:
     """Extracts the downloaded zip to a fresh temp staging folder and
-    returns the path to the extracted 'KBRS Markup' folder inside it. Never
-    touches the current install -- if this raises, nothing has changed."""
+    returns the path to the extracted build inside it -- a 'KBRS Markup'
+    folder on Windows, a 'KBRS Markup.app' bundle on Mac, matching whichever
+    this process actually is. Never touches the current install -- if this
+    raises, nothing has changed."""
     staging_root = tempfile.mkdtemp(prefix="kbrs_update_staged_")
     with zipfile.ZipFile(zip_path) as zf:
         zf.extractall(staging_root)
-    staged_app_dir = os.path.join(staging_root, "KBRS Markup")
+    expected_name = "KBRS Markup.app" if is_frozen_mac_build() else "KBRS Markup"
+    staged_app_dir = os.path.join(staging_root, expected_name)
     if not os.path.isdir(staged_app_dir):
         raise RuntimeError(
-            f"Downloaded update zip didn't contain a 'KBRS Markup' folder as expected "
+            f"Downloaded update zip didn't contain a '{expected_name}' folder as expected "
             f"(found: {os.listdir(staging_root)})"
         )
     return staged_app_dir
 
 
 def apply_update_and_relaunch(staged_app_dir: str) -> None:
+    """Dispatches to the platform-appropriate swap-and-relaunch mechanism --
+    see _apply_update_and_relaunch_windows()/_apply_update_and_relaunch_mac()
+    for the actual details, which differ a fair amount (a batch script vs. a
+    shell script; a Windows file-lock-driven wait vs. a plain PID wait).
+    Only call this after stage_update() has already succeeded -- the current
+    install isn't touched until this point, on either platform."""
+    if is_frozen_mac_build():
+        _apply_update_and_relaunch_mac(staged_app_dir)
+    else:
+        _apply_update_and_relaunch_windows(staged_app_dir)
+
+
+def _apply_update_and_relaunch_windows(staged_app_dir: str) -> None:
     """Writes a small batch script that waits for this process to fully
     exit (releasing its file locks), swaps the staged new build into place,
     relaunches the app, and cleans up after itself -- then launches that
@@ -331,9 +373,7 @@ def apply_update_and_relaunch(staged_app_dir: str) -> None:
     the swap can proceed. If the swap fails for any reason, the script
     restores the previous install rather than leaving a half-updated,
     broken folder; if it can never get exclusive access at all, it gives up
-    and relaunches whatever's already there. Only call this after
-    stage_update() has already succeeded -- the current install isn't
-    touched until this point."""
+    and relaunches whatever's already there."""
     app_dir = os.path.dirname(sys.executable)
     exe_name = os.path.basename(sys.executable)
     staging_root = os.path.dirname(staged_app_dir)
@@ -419,9 +459,79 @@ def apply_update_and_relaunch(staged_app_dir: str) -> None:
     os._exit(0)
 
 
+def _apply_update_and_relaunch_mac(staged_app_dir: str) -> None:
+    """Writes a small shell script that waits for this process to fully
+    exit, swaps the staged new '.app' bundle into place, relaunches it (via
+    `open`, same as double-clicking it in Finder), and cleans up after
+    itself -- then launches that script as a fully detached background
+    process and exits this one immediately so the swap can proceed. No
+    Windows-style file-lock retry loop is needed here: a plain PID wait
+    (`kill -0`) is enough, since macOS doesn't lock a running app bundle's
+    files against being renamed/replaced out from under it the way Windows
+    does an open .exe -- the loop still waits out of caution (replacing the
+    bundle mid-launch could otherwise leave a half-written app on disk), but
+    doesn't need the giveup/retry dance the Windows version does to work
+    around an actual OS-level lock. If the swap fails for any reason, the
+    script restores the previous install rather than leaving a
+    half-updated, broken bundle."""
+    app_bundle = Path(sys.executable).resolve().parent.parent.parent  # .../KBRS Markup.app
+    app_dir = str(app_bundle)
+    staging_root = os.path.dirname(staged_app_dir)
+    old_dir = app_dir + "_old"
+
+    sh_fd, sh_path = tempfile.mkstemp(suffix=".sh", prefix="kbrs_apply_update_")
+    os.close(sh_fd)
+
+    script = f"""#!/bin/bash
+APP_DIR={shlex.quote(app_dir)}
+OLD_DIR={shlex.quote(old_dir)}
+STAGED_DIR={shlex.quote(staged_app_dir)}
+STAGING_ROOT={shlex.quote(staging_root)}
+PID={os.getpid()}
+
+rm -rf "$OLD_DIR"
+
+tries=0
+while kill -0 "$PID" 2>/dev/null; do
+    sleep 0.5
+    tries=$((tries + 1))
+    if [ "$tries" -ge 60 ]; then
+        break
+    fi
+done
+
+mv "$APP_DIR" "$OLD_DIR"
+if mv "$STAGED_DIR" "$APP_DIR"; then
+    rm -rf "$OLD_DIR"
+else
+    # the swap failed -- restore the previous install so the app still works
+    rm -rf "$APP_DIR"
+    mv "$OLD_DIR" "$APP_DIR"
+fi
+
+open "$APP_DIR"
+rm -rf "$STAGING_ROOT"
+rm -f "$0"
+"""
+    Path(sh_path).write_text(script)
+    os.chmod(sh_path, 0o755)
+
+    # start_new_session detaches this from the current process group, same
+    # purpose as Windows' CREATE_NEW_PROCESS_GROUP above -- so the script
+    # survives this process exiting via os._exit() right after.
+    subprocess.Popen(
+        ["/bin/bash", sh_path],
+        start_new_session=True,
+        close_fds=True,
+        cwd=tempfile.gettempdir(),
+    )
+    os._exit(0)
+
+
 # ---------------------------------------------------------------------------
-# Self-update, source-install flavor (Mac, or any non-frozen `python3 app.py`
-# checkout -- is_frozen_windows_build() is False there, so the zip-based flow
+# Self-update, source-install flavor (the older "folder of scripts +
+# KBRS Markup.command" Mac setup, or any non-frozen `python3 app.py`
+# checkout -- is_frozen_build() is False there, so the zip-based flow
 # above never applies). This install already updates itself via `git pull` on
 # every launch (see KBRS Markup.command/KBRS Markup.bat), but that only runs
 # at startup with no visible feedback while the app is already open. This
@@ -437,10 +547,10 @@ def _repo_dir() -> str:
 def is_git_source_install() -> bool:
     """True for a source checkout running inside a git working tree with an
     upstream tracking branch -- the only shape this update path understands.
-    False for the frozen Windows build (that one's handled above) and for
-    any source copy that isn't a normal git clone (e.g. a zip download),
-    where there's nothing to fetch/pull against."""
-    if is_frozen_windows_build():
+    False for either frozen build (those are handled above) and for any
+    source copy that isn't a normal git clone (e.g. a zip download), where
+    there's nothing to fetch/pull against."""
+    if is_frozen_build():
         return False
     if not os.path.isdir(os.path.join(_repo_dir(), ".git")):
         return False

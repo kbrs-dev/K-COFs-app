@@ -1,0 +1,80 @@
+name: Build Mac app
+
+# Builds a Mac .app on every push to main (PyInstaller can't cross-compile
+# from Windows/Linux -- GitHub's macos-latest runner). Publishes it to a
+# single rolling release ("mac-latest-build") so computers can bookmark one
+# stable download link and just re-download it after any update, instead of
+# hunting for a new URL each time. Mirrors build-windows.yml -- see that
+# file's comments for the parts that are identical; this one only calls out
+# where Mac genuinely needs something different.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "app.py"
+      - "kbrs_markup.py"
+      - "kbrs_markup.spec"
+      - ".github/workflows/build-mac.yml"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install reportlab pypdf Pillow tkinterdnd2 pypdfium2 pikepdf numpy pyinstaller
+
+      - name: Build with PyInstaller
+        run: pyinstaller kbrs_markup.spec --noconfirm
+
+      - name: Stamp this build's version
+        # Lives inside the .app bundle itself (Contents/Resources), unlike
+        # Windows where it sits next to the .exe -- see
+        # engine.get_local_version()'s docstring for why. Also uploaded
+        # standalone below, same as Windows, so the running app can check
+        # "am I behind?" without downloading the whole zip just to find out.
+        run: echo -n "${{ github.sha }}" > "dist/KBRS Markup.app/Contents/Resources/version.txt"
+
+      - name: Zip the build
+        # ditto (not plain zip/Compress-Archive) is the macOS-native way to
+        # zip an .app bundle without mangling its resource forks/extended
+        # attributes. --keepParent so the zip contains "KBRS Markup.app" at
+        # its root, matching what stage_update() expects to find.
+        run: ditto -c -k --sequesterRsrc --keepParent "dist/KBRS Markup.app" "KBRS-Markup-Mac.zip"
+
+      - name: Publish rolling release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: mac-latest-build
+          name: KBRS Markup (Mac) — latest
+          body: |
+            Automatically rebuilt from the latest push to main.
+
+            **To install:** download `KBRS-Markup-Mac.zip`, unzip it, and drag
+            `KBRS Markup.app` wherever you keep it (e.g. Applications). The
+            first time you open it, macOS will say "Apple could not verify
+            this app" -- right-click (or Control-click) it -> Open -> Open
+            again. You only do this once; updates from inside the app don't
+            need it again.
+
+            **To update:** the app checks for updates on launch and can
+            install them itself (Check for Updates in the File menu, or the
+            banner when one's available). If you ever need to do it
+            manually, re-download this same file and replace the old
+            KBRS Markup.app with the new one.
+          files: |
+            KBRS-Markup-Mac.zip
+            dist/KBRS Markup.app/Contents/Resources/version.txt
+          make_latest: true
