@@ -45,13 +45,31 @@ jobs:
         # engine.get_local_version()'s docstring for why. Also uploaded
         # standalone below, same as Windows, so the running app can check
         # "am I behind?" without downloading the whole zip just to find out.
+        # Runs BEFORE signing below -- anything that touches the bundle's
+        # contents has to happen before that, or it invalidates the
+        # signature just applied.
         run: echo -n "${{ github.sha }}" > "dist/KBRS Markup.app/Contents/Resources/version.txt"
+
+      - name: Sign the app (ad-hoc)
+        # No Apple Developer account/certificate involved (that's a paid,
+        # separate step -- see the README's note on the two Mac packaging
+        # tiers) -- "-" means "sign with no real identity," which still
+        # satisfies the one thing this actually fixes: Apple Silicon Macs
+        # refuse to run ANY completely unsigned code at all, surfacing as
+        # "'KBRS Markup.app' is damaged and can't be opened" (not the
+        # softer "unidentified developer" prompt an ad-hoc-signed app gets
+        # instead) -- a real failure hit on a real Apple Silicon Mac the
+        # very first time this build ever shipped. --deep covers the
+        # bundled Python/Tcl-Tk/etc. binaries inside, not just the outer
+        # wrapper.
+        run: codesign --force --deep --sign - "dist/KBRS Markup.app"
 
       - name: Zip the build
         # ditto (not plain zip/Compress-Archive) is the macOS-native way to
         # zip an .app bundle without mangling its resource forks/extended
-        # attributes. --keepParent so the zip contains "KBRS Markup.app" at
-        # its root, matching what stage_update() expects to find.
+        # attributes (including the signature just applied above).
+        # --keepParent so the zip contains "KBRS Markup.app" at its root,
+        # matching what stage_update() expects to find.
         run: ditto -c -k --sequesterRsrc --keepParent "dist/KBRS Markup.app" "KBRS-Markup-Mac.zip"
 
       - name: Publish rolling release
@@ -68,6 +86,11 @@ jobs:
             this app" -- right-click (or Control-click) it -> Open -> Open
             again. You only do this once; updates from inside the app don't
             need it again.
+
+            If instead macOS says the app "is damaged and can't be opened,"
+            open Terminal and run (dragging the app into Terminal after
+            typing `xattr -cr ` pastes its exact path):
+            `xattr -cr /path/to/KBRS Markup.app`, then try opening it again.
 
             **To update:** the app checks for updates on launch and can
             install them itself (Check for Updates in the File menu, or the

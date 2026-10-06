@@ -46,6 +46,9 @@ Windows machines. **GitHub Desktop** (free, no command line) is the easiest way 
    - The first time, macOS will say "Apple could not verify this app." Right-click (or
      Control-click) it → **Open** → **Open** again. You only do this once, ever -- updates
      installed from inside the app afterward don't need this again.
+   - If instead macOS says the app **"is damaged and can't be opened,"** open Terminal, type
+     `xattr -cr ` (with a space after), drag **KBRS Markup.app** into the Terminal window, then
+     press Enter. Try opening it again -- it'll open normally this time.
 4. That's it -- no Python, no Terminal, no GitHub Desktop. Updates from here on happen with the
    "🔄 Update available" button inside the app (see above), the same as Windows.
 
