@@ -2548,15 +2548,16 @@ def main():
     top_bar.pack(fill="x", padx=8, pady=(6, 0))
     ttk.Button(top_bar, text="Accent color…", command=pick_accent_color).pack(side="right")
 
-    # -- self-update: the packaged Windows build downloads/stages/swaps a
-    # zip release (see engine.apply_update_and_relaunch()); a source
-    # checkout (Mac, or a non-frozen dev run of Windows) instead does a
+    # -- self-update: a packaged build (Windows .exe or Mac .app)
+    # downloads/stages/swaps a zip release (see
+    # engine.apply_update_and_relaunch()); a source checkout (the older
+    # "folder of scripts" Mac setup, or a non-frozen dev run) instead does a
     # plain `git pull` and relaunches itself in place
     # (engine.apply_git_update_and_relaunch()) -- same button/flow either
     # way, just a different mechanism underneath. Genuinely a no-op (button
     # never shows) for any other install shape, e.g. a plain zip download
     # with no git history to pull from.
-    if engine.is_frozen_windows_build():
+    if engine.is_frozen_build():
         _update_mode = "frozen"
     elif engine.is_git_source_install():
         _update_mode = "git"

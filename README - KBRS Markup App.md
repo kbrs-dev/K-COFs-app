@@ -13,7 +13,7 @@ No subscriptions, no accounts, no API keys.
 
 ## Using this on more than one computer (GitHub)
 
-This app lives in a private GitHub repo (`kbrs-dev/K-COFs-app`) so it can stay in sync across
+This app lives in a public GitHub repo (`kbrs-dev/K-COFs-app`) so it can stay in sync across
 multiple computers — for example, doing updates on a Mac and running the app on one or more
 Windows machines. **GitHub Desktop** (free, no command line) is the easiest way to handle this:
 
@@ -22,7 +22,8 @@ Windows machines. **GitHub Desktop** (free, no command line) is the easiest way 
   summary and click **Commit**, then **Push origin** to send it up to GitHub.
 - **On every other computer that just needs to run the app:** open GitHub Desktop → File → Clone
   Repository → paste `https://github.com/kbrs-dev/K-COFs-app.git` → pick a folder → Clone. That's
-  the one-time setup per computer.
+  the one-time setup per computer. (This step is only for the older script-based setup below --
+  the packaged Mac `.app` and Windows `.exe` don't need GitHub Desktop or a clone at all.)
 - **Every time you open the app**, the launcher (`KBRS Markup.command` on Mac, `KBRS Markup.bat`
   on Windows) automatically runs `git pull` first, so you always get the latest version without
   touching GitHub Desktop yourself — it only asks you to do anything when you're the one making
@@ -30,12 +31,26 @@ Windows machines. **GitHub Desktop** (free, no command line) is the easiest way 
 - **While the app is already open**, a "🔄 Update available" button appears at the top when
   there's something newer, and File > Check for Updates… checks on demand — no need to quit and
   reopen just to see if there's an update. Click it and the app updates and relaunches itself.
-  Windows also has this via its own separate self-updater (a packaged download); either way it's
-  the same button in the same spot.
+  This works the same way on every install -- the packaged `.app`/`.exe` and the script-based
+  setup each use whatever update mechanism fits them, but it's the same button in the same spot
+  either way.
 
 ## First-time setup (one time only, per computer)
 
-**Mac:**
+**Mac -- packaged app (recommended):**
+1. Go to <https://github.com/kbrs-dev/K-COFs-app/releases/tag/mac-latest-build> and download
+   `KBRS-Markup-Mac.zip`.
+2. Unzip it, then drag **KBRS Markup.app** wherever you want to keep it (e.g. your Applications
+   folder, or the Desktop).
+3. Double-click it to open.
+   - The first time, macOS will say "Apple could not verify this app." Right-click (or
+     Control-click) it → **Open** → **Open** again. You only do this once, ever -- updates
+     installed from inside the app afterward don't need this again.
+4. That's it -- no Python, no Terminal, no GitHub Desktop. Updates from here on happen with the
+   "🔄 Update available" button inside the app (see above), the same as Windows.
+
+**Mac -- older script-based setup** (still works, but the packaged app above is simpler for a
+new install):
 1. Check you have Python 3: open Terminal and type `python3 --version`.
    If it's missing, get it free at https://www.python.org/downloads/
 2. Double-click **KBRS Markup.command**.
