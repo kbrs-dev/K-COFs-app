@@ -655,6 +655,22 @@ def _flatten_pdf(path: str) -> str:
     return out_path
 
 
+def _image_page_points(img_w_px: float, img_h_px: float) -> tuple:
+    """The Letter-page-relative POINT dimensions ensure_pdf() gives an image
+    of this pixel size (pixels 1:1 with points, unless the long edge is
+    bigger than PAGE_H, in which case it's scaled down to match -- see
+    ensure_pdf() for why). Factored out so normalize_to_portrait_page()'s
+    direct-from-source render (see its own docstring) computes the exact
+    same point size ensure_pdf()'s wrapped PDF page would have, keeping it
+    in agreement with get_page_size() and the calibrated overlay math that
+    reads it."""
+    long_edge = max(img_w_px, img_h_px)
+    if long_edge > PAGE_H:
+        page_scale = PAGE_H / long_edge
+        return img_w_px * page_scale, img_h_px * page_scale
+    return float(img_w_px), float(img_h_px)
+
+
 def ensure_pdf(path: str) -> str:
     """If `path` is an image (jpg/png/etc.), wrap it in a one-page PDF sized
     to match the image's own true pixel proportions, and return the path to
@@ -690,16 +706,14 @@ def ensure_pdf(path: str) -> str:
     os.close(fd)
     img_reader = ImageReader(path)
     img_w, img_h = img_reader.getSize()
-    # img_w/img_h are the image's raw PIXEL dimensions -- a modern phone
-    # photo can be several thousand pixels on a side, which would otherwise
-    # become a page that many POINTS across (tens of inches), forcing
-    # constant scrolling to see any of it. Scale down (preserving the image's
-    # true proportions -- never distorting it) so the longer edge matches a
-    # normal page's long edge instead.
-    long_edge = max(img_w, img_h)
-    if long_edge > PAGE_H:
-        page_scale = PAGE_H / long_edge
-        img_w, img_h = img_w * page_scale, img_h * page_scale
+    # img_w/img_h start out as the image's raw PIXEL dimensions -- a modern
+    # phone photo can be several thousand pixels on a side, which would
+    # otherwise become a page that many POINTS across (tens of inches),
+    # forcing constant scrolling to see any of it. _image_page_points()
+    # scales down (preserving the image's true proportions -- never
+    # distorting it) so the longer edge matches a normal page's long edge
+    # instead.
+    img_w, img_h = _image_page_points(img_w, img_h)
     c = canvas.Canvas(out_path, pagesize=(img_w, img_h))
     c.drawImage(img_reader, 0, 0, width=img_w, height=img_h)
     c.save()
@@ -774,7 +788,7 @@ _MIN_PRINTED_LINE_WIDTH_PT = 0.4
 _MAX_THICKEN_BLOCK = 15
 
 
-def _thicken_thin_lines(pil_img, fit_scale: float):
+def _thicken_thin_lines(pil_img, fit_scale: float, render_scale: float):
     """Grows every dark feature outward by a small radius (pixel-block
     minimum-pooling, then nearest-neighbor upsampling back to full size --
     see below for why not a true sliding-window min filter), so a true
@@ -802,6 +816,13 @@ def _thicken_thin_lines(pil_img, fit_scale: float):
     shrunk drastically gets thickened just enough that even its thinnest
     hairline should reach roughly _MIN_PRINTED_LINE_WIDTH_PT once printed.
 
+    render_scale is pil_img's own actual pixels-per-point density -- usually
+    _BG_RENDER_SCALE (a pdfium render of a PDF source), but for an image
+    source normalize_to_portrait_page() loads directly at (at least) that
+    density without necessarily matching it exactly, so this has to be
+    passed in rather than assumed, or the radius below would be computed in
+    the wrong units whenever it differs.
+
     Implemented as block min-pooling (reshape into blocksize x blocksize
     tiles, take each tile's darkest pixel, upsample the result back to full
     size with nearest-neighbor) rather than PIL's ImageFilter.MinFilter --
@@ -813,7 +834,7 @@ def _thicken_thin_lines(pil_img, fit_scale: float):
     and around 7x faster in testing against that same file."""
     if fit_scale <= 0:
         return pil_img
-    radius_px = (_MIN_PRINTED_LINE_WIDTH_PT / fit_scale) * _BG_RENDER_SCALE / 2
+    radius_px = (_MIN_PRINTED_LINE_WIDTH_PT / fit_scale) * render_scale / 2
     block = min(_MAX_THICKEN_BLOCK, int(round(radius_px)) * 2 + 1)
     if block <= 1:
         return pil_img
@@ -907,8 +928,27 @@ def normalize_to_portrait_page(order_form_path: str, contrast: float = 1.0, fit:
     that "shrink the drawing to make room for an out-of-bounds item" never
     costs the same quality a manual rotate/resize already does (see
     get_transformed_order_form() for the one case -- a manual rotation
-    combined with an active fit -- that still needs a second pass)."""
-    base_path = ensure_pdf(order_form_path)
+    combined with an active fit -- that still needs a second pass).
+
+    An image-format source (JPG/PNG/etc., per IMAGE_EXTS) is loaded
+    directly via PIL here instead of going through ensure_pdf()+
+    _render_pil() like a PDF source does -- confirmed-by-algebra real bug,
+    not a guess: ensure_pdf() deliberately caps the wrapped PDF page's own
+    POINT size at PAGE_H (see its docstring) so the page isn't absurdly
+    huge, but _render_pil() then rasterizes relative to THAT capped point
+    size at the fixed _BG_RENDER_SCALE, hard-capping the result at
+    PAGE_H * _BG_RENDER_SCALE = 1980px on the long edge regardless of the
+    source's real pixel count -- silently throwing away resolution (and
+    with it, text/line sharpness) on any scan whose long edge exceeds that,
+    which a modern phone photo or scanner routinely does. Loading the
+    pixels directly sidesteps that cap entirely; render_scale (the actual
+    pixels-per-point density this gives, per _image_page_points()'s same
+    point-size convention) is kept at least _BG_RENDER_SCALE -- upsampling
+    only when the source is small enough that even the old pdfium path
+    would've upsampled past native too, so this never ships a LOWER-res
+    render than before, only a higher one when the source has it to give."""
+    ext = Path(order_form_path).suffix.lower()
+    is_image_source = ext in IMAGE_EXTS
     try:
         mtime = os.path.getmtime(order_form_path)
     except OSError:
@@ -918,10 +958,24 @@ def normalize_to_portrait_page(order_form_path: str, contrast: float = 1.0, fit:
     if cached and os.path.isfile(cached):
         return cached
 
-    pil_img = _render_pil(base_path)
-    img_w_pts, img_h_pts = pil_img.width / _BG_RENDER_SCALE, pil_img.height / _BG_RENDER_SCALE
+    if is_image_source:
+        with Image.open(order_form_path) as src:
+            pil_img = src.convert("RGB") if src.mode != "RGB" else src.copy()
+        img_w_pts, img_h_pts = _image_page_points(pil_img.width, pil_img.height)
+        render_scale = pil_img.width / img_w_pts
+        if render_scale < _BG_RENDER_SCALE:
+            target_w = max(1, round(img_w_pts * _BG_RENDER_SCALE))
+            target_h = max(1, round(img_h_pts * _BG_RENDER_SCALE))
+            pil_img = pil_img.resize((target_w, target_h), Image.LANCZOS)
+            render_scale = _BG_RENDER_SCALE
+    else:
+        base_path = ensure_pdf(order_form_path)
+        pil_img = _render_pil(base_path)
+        render_scale = _BG_RENDER_SCALE
+        img_w_pts, img_h_pts = pil_img.width / render_scale, pil_img.height / render_scale
+
     fit_scale = min(PAGE_W / img_w_pts, PAGE_H / img_h_pts)
-    pil_img = _thicken_thin_lines(pil_img, fit_scale)
+    pil_img = _thicken_thin_lines(pil_img, fit_scale, render_scale)
     if abs(contrast - 1.0) >= 0.001:
         pil_img = _darken_toward_black(pil_img, contrast)
     draw_w, draw_h = img_w_pts * fit_scale, img_h_pts * fit_scale
